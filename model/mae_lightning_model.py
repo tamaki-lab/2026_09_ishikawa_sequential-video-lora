@@ -33,8 +33,6 @@ class MAELightningModule(pl.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        print(f"MAELightningModule training: {self.training}")
-        print(f"ViTMAEForPreTraining training: {self.model.training}")
 
         pixel_values = batch["pixel_values"]
         outputs = self(pixel_values=pixel_values)
