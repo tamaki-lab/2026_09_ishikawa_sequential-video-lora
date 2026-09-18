@@ -1,52 +1,28 @@
-from .sequential_video_folder import sequential_video_folder
-from .sequential.epic_kitchens.epic_kitchens_sequential_data_folder import (
-    epic_kitchens_sequential_data_folder,
-    EpicKitchensSequentialDataFolderInfo,
-)
-from .sequential.salads50.salads50_sequential_data_folder import (
-    salads50_sequential_data_folder,
-    Salads50SequentialDataFolderInfo,
-)
-
-
+from .cifar10 import cifar10, Cifar10Info
+from .image_folder import image_folder, ImageFolderInfo
+from .video_folder import video_folder, VideoFolderInfo
+from .zero_images import zero_images, ZeroImageInfo
 from .transforms import (
     transform_image, TransformImageInfo,
     transform_video, TransformVideoInfo,
-    build_sequential_video_transform,
 )
 from .dataloader_factory import configure_dataloader, DataloadersInfo
 from .dataset_pl import TrainValDataModule
 
 __all__ = [
-    'sequential_video_folder',
-    'epic_kitchens_sequential_data_folder',
-    'EpicKitchensSequentialDataFolderInfo',
-    'salads50_sequential_data_folder',
-    'Salads50SequentialDataFolderInfo',
+    'cifar10',
+    'Cifar10Info',
+    'image_folder',
+    'ImageFolderInfo',
+    'video_folder',
+    'VideoFolderInfo',
+    'zero_images',
+    'ZeroImageInfo',
     'transform_image',
     'TransformImageInfo',
     'transform_video',
     'TransformVideoInfo',
-    'build_sequential_video_transform',
     'configure_dataloader',
     'DataloadersInfo',
-    'TrainValDataModule',
+    'TrainValDataModule'
 ]
-
-
-def __getattr__(name):
-    if name in {"configure_dataloader", "DataloadersInfo"}:
-        from .dataloader_factory import configure_dataloader, DataloadersInfo
-
-        namespace = {
-            "configure_dataloader": configure_dataloader,
-            "DataloadersInfo": DataloadersInfo,
-        }
-        return namespace[name]
-
-    if name == "TrainValDataModule":
-        from .dataset_pl import TrainValDataModule
-
-        return TrainValDataModule
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

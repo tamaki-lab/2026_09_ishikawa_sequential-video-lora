@@ -39,14 +39,7 @@ class ArgParse:
             "--dataset_name",
             type=str,
             default="CIFAR10",
-            choices=[
-                "CIFAR10",
-                "ImageFolder",
-                "VideoFolder",
-                "ZeroImages",
-                "SequentialVideoFolder",
-                "EpicKitchenSequentialDataset",
-                "Salads50SequentialDataset"],
+            choices=["CIFAR10", "ImageFolder", "VideoFolder", "ZeroImages"],
             help="name of dataset.",
         )
         parser.add_argument(
@@ -63,137 +56,7 @@ class ArgParse:
             default="val",
             help="subdir name from root for validation set.",
         )
-        parser.add_argument(
-            "--video_edge_time",
-            type=float,
-            default=0.5,
-            help="number of seconds to ignore the end of the video",
-            #       sequential_video_folder
-        )
-        parser.add_argument(
-            "--ext",
-            type=str,
-            default="*.MP4,*.mp4",
-            help="video file extension glob pattern(s). Use comma-separated values for multiple patterns.",
-            #       sequential_video_folder
-        )
-        parser.add_argument(
-            "--sequential_label_mode",
-            type=str,
-            default="video",
-            choices=[
-                "video",
-                "frame"],
-            help="label mode for SequentialVideoFolder. video: one label per video/clip. frame: one label per frame in a clip.",
-        )
-        parser.add_argument(
-            "--train_annotation_path",
-            type=str,
-            default=None,
-            help="EPIC-Kitchens train annotation CSV for SequentialVideoFolder frame mode.",
-        )
-        parser.add_argument(
-            "--val_annotation_path",
-            type=str,
-            default=None,
-            help="EPIC-Kitchens validation annotation CSV for SequentialVideoFolder frame mode.",
-        )
-        parser.add_argument(
-            "--epic_label_type",
-            type=str,
-            default="verb",
-            choices=[
-                "verb",
-                "noun",
-                "action",
-                "verb_noun"],
-            help="EPIC-Kitchens label type to use in sequential datasets. Use verb_noun for paired multi-head verb/noun targets.",
-        )
-        parser.add_argument(
-            "--epic_task",
-            type=str,
-            default="action_recognition",
-            choices=["action_recognition", "action_anticipation"],
-            help="EPIC-Kitchens task mode for EpicKitchenSequentialDataset.",
-        )
-        parser.add_argument(
-            "--epic_anticipation_time",
-            type=float,
-            default=1.0,
-            help="seconds of observation gap before the target action for EPIC anticipation.",
-        )
-        parser.add_argument(
-            "--background_label",
-            type=str,
-            default="background",
-            help="fallback label for frames without annotation in SequentialVideoFolder frame mode.",
-        )
-        parser.add_argument(
-            "--label_granularity",
-            type=str,
-            default="fine",
-            choices=["coarse", "fine"],
-            help="label granularity for supported sequential datasets such as 50Salads.",
-        )
-        parser.add_argument(
-            "--split_id",
-            type=int,
-            default=1,
-            help="dataset split id for supported sequential datasets such as 50Salads.",
-        )
-        parser.add_argument(
-            "--annotation_root",
-            type=str,
-            default=None,
-            help="root directory containing frame-level annotation files.",
-        )
-        parser.add_argument(
-            "--train_annotation_root",
-            type=str,
-            default=None,
-            help="optional train-only annotation directory. Falls back to --annotation_root when omitted.",
-        )
-        parser.add_argument(
-            "--val_annotation_root",
-            type=str,
-            default=None,
-            help="optional val-only annotation directory. Falls back to --annotation_root when omitted.",
-        )
-        parser.add_argument(
-            "--split_root",
-            type=str,
-            default=None,
-            help="root directory containing train/val split files.",
-        )
-        parser.add_argument(
-            "--train_split_root",
-            type=str,
-            default=None,
-            help="optional train-only split directory. Falls back to --split_root when omitted.",
-        )
-        parser.add_argument(
-            "--val_split_root",
-            type=str,
-            default=None,
-            help="optional val-only split directory. Falls back to --split_root when omitted.",
-        )
-        parser.add_argument(
-            "--label_map_path",
-            type=str,
-            default=None,
-            help="optional label map file to define class ordering explicitly.",
-        )
-        parser.add_argument(
-            "--debug_train_batch_metrics",
-            action="store_true",
-            help="print detailed metrics for the first training batch and batches with very high train_top1.",
-        )
-        parser.add_argument(
-            "--max_train_clips_per_video",
-            type=int,
-            default=None,
-            help="optional cap on the number of train clips used per video for supported sequential datasets such as 50Salads.",
-        )
+
         # model
         parser.add_argument(
             "--torch_home",
@@ -207,7 +70,7 @@ class ArgParse:
             "--model_name",
             type=str,
             default="resnet18",
-            choices=["resnet18", "resnet50", "x3d", "abn_r50", "vit_b", "memvit", "zero_output_dummy"],
+            choices=["resnet18", "resnet50", "x3d", "abn_r50", "vit_b", "zero_output_dummy"],
             help="name of the model",
         )
 
@@ -288,7 +151,7 @@ class ArgParse:
             "--optimizer_name",
             type=str,
             default="SGD",
-            choices=["SGD", "Adam", "AdamW", "OrthogonalSGD", "OrthogonalAdamW"],
+            choices=["SGD", "Adam"],
             help="optimizer name.",
         )
         parser.add_argument(
@@ -314,18 +177,6 @@ class ArgParse:
             type=float,
             default=5e-4,
             help="weight decay."
-        )
-        parser.add_argument(
-            "--orthogonal_beta",
-            type=float,
-            default=0.9,
-            help="EMA coefficient for orthogonal gradient history.",
-        )
-        parser.add_argument(
-            "--orthogonal_eps",
-            type=float,
-            default=1e-12,
-            help="minimum squared norm for orthogonal projection.",
         )
         parser.add_argument(
             "--use_scheduler",
@@ -396,55 +247,6 @@ class ArgParse:
             action="store_true",
             help="do not use comet.ml (default: use comet)",
         )
-
-        parser.add_argument(
-            "--loop_mode",
-            type=str,
-            default="train",
-            choices=["train", "val_only"],
-            help="training mode: 'train' for training loop, 'val_only' for validation only.",
-        )
-        parser.add_argument(
-            "-vis",
-            "--val_interval_steps",
-            type=int,
-            default=None,
-            help="validation interval in steps.",
-        )
-
-        # 以下parser4つ yaml用に追加
-
-        # config file
-        parser.add_argument(
-            "--cfg_file",
-            type=str,
-            default=None,
-            help="path to config YAML file",
-        )
-
-        # config override options
-        parser.add_argument(
-            "--opts",
-            nargs="+",
-            type=str,
-            default=None,
-            help="CLI override options (e.g., --opts TRAIN.BATCH_SIZE 32)",
-        )
-
-        # distributed training
-        parser.add_argument(
-            "--num_shards",
-            type=int,
-            default=1,
-            help="number of shards for distributed training",
-        )
-        parser.add_argument(
-            "--shard_id",
-            type=int,
-            default=0,
-            help="shard id for distributed training",
-        )
-
         parser.set_defaults(disable_comet=False)
 
         args = parser.parse_args()

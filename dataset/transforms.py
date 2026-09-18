@@ -86,53 +86,6 @@ def transform_video(
     return train_transform, val_transform
 
 
-def build_sequential_video_transform(
-        trans_video_info: TransformVideoInfo
-) -> Tuple[image_transform.Compose, image_transform.Compose]:
-    """transform for sequential video clips
-
-    Args:
-        trans_video_info (TransformVideoInfo): information for video transform
-
-    Returns:
-        Tuple[torchvision.transforms.Compose]: train and val transforms
-    """
-
-    train_transform = image_transform.Compose([
-        video_transform.UniformTemporalSubsample(
-            trans_video_info.frames_per_clip
-        ),
-        image_transform.Lambda(lambda x: x / 255.0),
-        video_transform.Normalize(
-            [0.485, 0.456, 0.406],
-            [0.229, 0.224, 0.225]
-        ),
-        video_transform.RandomShortSideScale(
-            min_size=trans_video_info.min_shorter_side_size,
-            max_size=trans_video_info.max_shorter_side_size
-        ),
-        image_transform.RandomCrop(trans_video_info.crop_size),
-        image_transform.RandomHorizontalFlip(),
-    ])
-
-    val_transform = image_transform.Compose([
-        video_transform.UniformTemporalSubsample(
-            trans_video_info.frames_per_clip
-        ),
-        image_transform.Lambda(lambda x: x / 255.0),
-        video_transform.Normalize(
-            [0.485, 0.456, 0.406],
-            [0.229, 0.224, 0.225]
-        ),
-        video_transform.ShortSideScale(
-            trans_video_info.val_shorter_side_size
-        ),
-        image_transform.CenterCrop(trans_video_info.crop_size),
-    ])
-
-    return train_transform, val_transform
-
-
 def transform_image(
         trans_image_info: TransformImageInfo
 ) -> Tuple[image_transform.Compose, image_transform.Compose]:

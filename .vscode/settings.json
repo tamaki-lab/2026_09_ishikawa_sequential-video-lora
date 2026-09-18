@@ -9,13 +9,12 @@
     },
     "editor.renderWhitespace": "boundary",
     "trailing-spaces.trimOnSave": true,
-    "files.autoSave": "off",
+    "files.autoSave": "onFocusChange",
     "files.insertFinalNewline": true,
     "files.trimFinalNewlines": true,
     "files.trimTrailingWhitespace": true,
     "editor.formatOnSave": true,
     "editor.formatOnPaste": true,
-    "python.defaultInterpreterPath": "/mnt/HDD10TB-2/ishikawa/2026_04_ishikawa_simple-MeMViT/.venv-memvit/bin/python",
     "editor.rulers": [
         80,
         88
