@@ -8,7 +8,7 @@ class ViTFrameEncoder(nn.Module):
 
     def __init__(self, checkpoint_id: str = "google/vit-base-patch16-224"):
         super().__init__()
-        self.vit = ViTModel.from_pretrained(checkpoint_id, add_pooling_layer=False)
+        self.vit = ViTModel.from_pretrained(checkpoint_id)
         self.vit.requires_grad_(False)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
