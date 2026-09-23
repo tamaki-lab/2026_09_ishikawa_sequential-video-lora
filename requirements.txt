@@ -35,7 +35,8 @@ lightning
 
 
 ## huggingface
-transformers[torch]
+transformers[torch]==5.17.0
+peft==0.21.0
 # huggingface_hub[cli,torch]
 # accelerate
 datasets[vision]

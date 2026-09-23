@@ -25,7 +25,7 @@ class TestViTFrameEncoder(unittest.TestCase):
         with patch('model.vit.vit_frame_encoder.ViTModel.from_pretrained', return_value=FakeViT()) as load:
             encoder = ViTFrameEncoder()
 
-        load.assert_called_once_with('google/vit-base-patch16-224')
+        load.assert_called_once_with('google/vit-base-patch16-224', add_pooling_layer=False)
         self.assertTrue(all(not parameter.requires_grad for parameter in encoder.vit.parameters()))
         features = encoder(torch.zeros(2, 3, 224, 224))
         self.assertEqual(tuple(features.shape), (2, 768))
