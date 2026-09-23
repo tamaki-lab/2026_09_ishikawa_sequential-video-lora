@@ -1,0 +1,4 @@
+name: VideoFolder
+root: ./downloaded_data
+train_dir: train
+val_dir: val

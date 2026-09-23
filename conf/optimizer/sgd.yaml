@@ -1,0 +1,4 @@
+name: SGD
+lr: 1.0e-4
+weight_decay: 5.0e-4
+momentum: 0.9

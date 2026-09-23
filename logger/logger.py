@@ -11,7 +11,7 @@ def configure_logger(
 
     Args:
         logged_params (dict): hyperparameters to be logged in comet.
-            Typically "vars(args)" for logging all parameters in "args".
+            Pass a resolved Python mapping of the training configuration.
         model_name (str): modelname to be added as a tag of comet experiment
         disable_logging (bool): disable comet Experiment object
 

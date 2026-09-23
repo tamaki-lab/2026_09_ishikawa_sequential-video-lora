@@ -1,6 +1,5 @@
-from typing import Literal
 from dataclasses import dataclass
-import argparse
+from omegaconf import DictConfig
 
 from torch.utils.data import DataLoader
 
@@ -33,19 +32,17 @@ class DataloadersInfo:
     n_classes: int
 
 
-SupportedDatasets = Literal["CIFAR10", "ImageFolder", "VideoFolder", "ZeroImages"]
-
-
 def configure_dataloader(
-    command_line_args: argparse.Namespace,
-    dataset_name: SupportedDatasets,
+    dataset_cfg: DictConfig,
+    loader_cfg: DictConfig,
+    video_cfg: DictConfig,
 ):
     """dataloader factory
 
     Args:
-        command_line_args (argparse.Namespace): command line args
-        dataset_name (SupportedDatasets): dataset name (str).
-            ["CIFAR10", "ImageFolder", "VideoFolder", "ZeroImages"]
+        dataset_cfg (DictConfig): dataset name, root and split directories
+        loader_cfg (DictConfig): batch size and worker count
+        video_cfg (DictConfig): clip sampling settings
 
     Raises:
         ValueError: invalid dataset_name is given
@@ -54,16 +51,16 @@ def configure_dataloader(
         (DataloadersInfo): dataset information
     """
 
-    args = command_line_args
+    dataset_name = dataset_cfg.name
 
     if dataset_name == "CIFAR10":
         train_transform, val_transform = \
             transform_image(TransformImageInfo())
         train_loader, val_loader, n_classes = \
             cifar10(Cifar10Info(
-                root=args.root,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
+                root=dataset_cfg.root,
+                batch_size=loader_cfg.batch_size,
+                num_workers=loader_cfg.num_workers,
                 train_transform=train_transform,
                 val_transform=val_transform
             ))
@@ -73,11 +70,11 @@ def configure_dataloader(
             transform_image(TransformImageInfo())
         train_loader, val_loader, n_classes = \
             image_folder(ImageFolderInfo(
-                root=args.root,
-                train_dir=args.train_dir,
-                val_dir=args.val_dir,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
+                root=dataset_cfg.root,
+                train_dir=dataset_cfg.train_dir,
+                val_dir=dataset_cfg.val_dir,
+                batch_size=loader_cfg.batch_size,
+                num_workers=loader_cfg.num_workers,
                 train_transform=train_transform,
                 val_transform=val_transform
             ))
@@ -85,19 +82,19 @@ def configure_dataloader(
     elif dataset_name == "VideoFolder":
         train_transform, val_transform = \
             transform_video(TransformVideoInfo(
-                frames_per_clip=args.frames_per_clip
+                frames_per_clip=video_cfg.frames_per_clip
             ))
         train_loader, val_loader, n_classes = \
             video_folder(VideoFolderInfo(
-                root=args.root,
-                train_dir=args.train_dir,
-                val_dir=args.val_dir,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
+                root=dataset_cfg.root,
+                train_dir=dataset_cfg.train_dir,
+                val_dir=dataset_cfg.val_dir,
+                batch_size=loader_cfg.batch_size,
+                num_workers=loader_cfg.num_workers,
                 train_transform=train_transform,
                 val_transform=val_transform,
-                clip_duration=args.clip_duration,
-                clips_per_video=args.clips_per_video
+                clip_duration=video_cfg.clip_duration,
+                clips_per_video=video_cfg.clips_per_video
             ))
 
     elif dataset_name == "ZeroImages":
@@ -105,8 +102,8 @@ def configure_dataloader(
             transform_image(TransformImageInfo())
         train_loader, val_loader, n_classes = \
             zero_images(ZeroImageInfo(
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
+                batch_size=loader_cfg.batch_size,
+                num_workers=loader_cfg.num_workers,
                 transform=train_transform,
             ))
 

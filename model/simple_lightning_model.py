@@ -1,5 +1,6 @@
-import argparse
 import os
+
+from omegaconf import DictConfig
 
 
 import lightning.pytorch as pl
@@ -24,7 +25,10 @@ class SimpleLightningModel(pl.LightningModule):
 
     def __init__(
             self,
-            command_line_args: argparse.Namespace,
+            model_cfg: DictConfig,
+            optimizer_cfg: DictConfig,
+            scheduler_cfg: DictConfig,
+            checkpoint_cfg: DictConfig,
             n_classes: int,
             exp_name: str,
     ):
@@ -34,18 +38,23 @@ class SimpleLightningModel(pl.LightningModule):
         https://lightning.ai/docs/pytorch/stable/starter/style_guide.html#init
 
         Args:
-            command_line_args (argparse): args
+            model_cfg (DictConfig): model and pretrained weight settings
+            optimizer_cfg (DictConfig): optimizer hyperparameters
+            scheduler_cfg (DictConfig): scheduler enable flag
+            checkpoint_cfg (DictConfig): checkpoint paths
             n_classes (int): number of categories
             exp_name (str): experiment name of comet.ml
         """
         super().__init__()
-        self.args = command_line_args
+        self.optimizer_cfg = optimizer_cfg
+        self.scheduler_cfg = scheduler_cfg
+        self.checkpoint_cfg = checkpoint_cfg
         self.exp_name = exp_name
 
         self.model = configure_model(ModelConfig(
-            model_name=self.args.model_name,
-            use_pretrained=self.args.use_pretrained,
-            torch_home=self.args.torch_home,
+            model_name=model_cfg.name,
+            use_pretrained=model_cfg.use_pretrained,
+            torch_home=model_cfg.torch_home,
             n_classes=n_classes,
         ))
 
@@ -58,15 +67,15 @@ class SimpleLightningModel(pl.LightningModule):
         """
 
         optimizer = configure_optimizer(
-            optimizer_name=self.args.optimizer_name,
-            lr=self.args.lr,
-            weight_decay=self.args.weight_decay,
-            momentum=self.args.momentum,
+            optimizer_name=self.optimizer_cfg.name,
+            lr=self.optimizer_cfg.lr,
+            weight_decay=self.optimizer_cfg.weight_decay,
+            momentum=self.optimizer_cfg.momentum,
             model_params=self.model.parameters()
         )
         scheduler = configure_scheduler(
             optimizer=optimizer,
-            use_scheduler=self.args.use_scheduler
+            use_scheduler=self.scheduler_cfg.enabled
         )
 
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
@@ -76,7 +85,7 @@ class SimpleLightningModel(pl.LightningModule):
         https://lightning.ai/docs/pytorch/stable/common/lightning_module.html#configure-callbacks
         """
 
-        save_checkpoint_dir = os.path.join(self.args.save_checkpoint_dir, self.exp_name)
+        save_checkpoint_dir = os.path.join(self.checkpoint_cfg.save_dir, self.exp_name)
         if self.global_rank == 0:
             os.makedirs(save_checkpoint_dir, exist_ok=True)
 

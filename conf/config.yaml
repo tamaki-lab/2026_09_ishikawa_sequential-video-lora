@@ -1,0 +1,43 @@
+defaults:
+  - dataset: cifar10
+  - model: resnet18
+  - optimizer: sgd
+  - _self_
+
+loader:
+  batch_size: 8
+  num_workers: 2
+
+video:
+  frames_per_clip: 16
+  clip_duration: 2.6666666666666665
+  clips_per_video: 1
+
+trainer:
+  num_epochs: 25
+  val_interval_epochs: 1
+  log_interval_steps: 1
+  grad_accum: 1
+  use_dp: false
+  devices: "-1"
+
+scheduler:
+  enabled: false
+
+logging:
+  comet_log_dir: ./comet_logs/
+  tf_log_dir: ./tf_logs/
+  disable_comet: false
+
+checkpoint:
+  save_dir: ./log
+  resume: null
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: log/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+  sweep:
+    dir: log/hydra/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+    subdir: ${hydra.job.num}

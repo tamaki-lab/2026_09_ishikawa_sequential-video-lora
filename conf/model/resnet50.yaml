@@ -1,0 +1,3 @@
+name: resnet50
+use_pretrained: true
+torch_home: ./pretrained_models

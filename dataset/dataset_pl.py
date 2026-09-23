@@ -1,4 +1,4 @@
-import argparse
+from omegaconf import DictConfig
 
 import lightning.pytorch as pl
 
@@ -8,16 +8,17 @@ from dataset import configure_dataloader
 class TrainValDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        command_line_args: argparse.Namespace,
-        dataset_name: str,
+        dataset_cfg: DictConfig,
+        loader_cfg: DictConfig,
+        video_cfg: DictConfig,
     ):
         super().__init__()
-        self.args = command_line_args
 
         self.dataloaders_info = \
             configure_dataloader(
-                command_line_args=command_line_args,
-                dataset_name=dataset_name  # type: ignore[arg-type]
+                dataset_cfg=dataset_cfg,
+                loader_cfg=loader_cfg,
+                video_cfg=video_cfg,
             )
 
     def train_dataloader(self):

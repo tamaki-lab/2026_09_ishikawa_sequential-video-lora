@@ -1,11 +1,13 @@
-import argparse
+import logging
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
 from tqdm import tqdm
 
 import torch
 from torch import nn
 
-from args import ArgParse
 from dataset import configure_dataloader
 from model import (
     configure_model,
@@ -35,58 +37,59 @@ class TqdmEpoch(tqdm):
         )
 
 
-def prepare_training(args: argparse.Namespace):
-    """prepare training objects from args
+def prepare_training(cfg: DictConfig):
+    """prepare training objects from the composed config
 
     Args:
-        args (argparse.Namespace): command line argmentrs
+        cfg (DictConfig): nested training configuration
 
     Returns:
         a set of training objects
     """
 
     logger = configure_logger(
-        logged_params=vars(args),
-        model_name=args.model_name,
-        disable_logging=args.disable_comet,
+        logged_params=OmegaConf.to_container(cfg, resolve=True),
+        model_name=cfg.model.name,
+        disable_logging=cfg.logging.disable_comet,
     )
 
     dataloaders = configure_dataloader(
-        command_line_args=args,
-        dataset_name=args.dataset_name,
+        dataset_cfg=cfg.dataset,
+        loader_cfg=cfg.loader,
+        video_cfg=cfg.video,
     )
 
     assert torch.cuda.is_available()
     device = torch.device("cuda")
 
     model = configure_model(ModelConfig(
-        model_name=args.model_name,
-        use_pretrained=args.use_pretrained,
-        torch_home=args.torch_home,
+        model_name=cfg.model.name,
+        use_pretrained=cfg.model.use_pretrained,
+        torch_home=cfg.model.torch_home,
         n_classes=dataloaders.n_classes,
     ))
     model = model.to(device)
-    if args.use_dp:
+    if cfg.trainer.use_dp:
         model = nn.DataParallel(model)  # type: ignore[assignment]
 
     optimizer = configure_optimizer(
-        optimizer_name=args.optimizer_name,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        momentum=args.momentum,
+        optimizer_name=cfg.optimizer.name,
+        lr=cfg.optimizer.lr,
+        weight_decay=cfg.optimizer.weight_decay,
+        momentum=cfg.optimizer.momentum,
         model_params=model.parameters()
     )
     scheduler = configure_scheduler(
         optimizer=optimizer,
-        use_scheduler=args.use_scheduler
+        use_scheduler=cfg.scheduler.enabled
     )
 
     train_config = TrainConfig(
-        grad_accum_interval=args.grad_accum,
-        log_interval_steps=args.log_interval_steps
+        grad_accum_interval=cfg.trainer.grad_accum,
+        log_interval_steps=cfg.trainer.log_interval_steps
     )
 
-    if args.checkpoint_to_resume:
+    if cfg.checkpoint.resume:
         (
             start_epoch,
             current_train_step,
@@ -95,7 +98,7 @@ def prepare_training(args: argparse.Namespace):
             optimizer,
             scheduler,
         ) = load_from_checkpoint(  # type: ignore[assignment]
-            args.checkpoint_to_resume,
+            cfg.checkpoint.resume,
             model,
             optimizer,
             scheduler,
@@ -131,9 +134,11 @@ class ValidationChecker:
         )
 
 
-def main():
-
-    args = ArgParse.get()
+@hydra.main(version_base="1.3", config_path="conf", config_name="config")
+def main(cfg: DictConfig):
+    logging.getLogger(__name__).info(
+        "Resolved config:\n%s", OmegaConf.to_yaml(cfg, resolve=True)
+    )
 
     (
         logger,
@@ -145,12 +150,12 @@ def main():
         current_train_step,
         current_val_step,
         start_epoch,
-    ) = prepare_training(args)
+    ) = prepare_training(cfg)
 
-    val_checker = ValidationChecker(args.val_interval_epochs, args.num_epochs)
+    val_checker = ValidationChecker(cfg.trainer.val_interval_epochs, cfg.trainer.num_epochs)
 
     with TqdmEpoch(
-        start_epoch, args.num_epochs, unit='epoch',
+        start_epoch, cfg.trainer.num_epochs, unit='epoch',
     ) as progress_bar_epoch:
         for current_epoch in progress_bar_epoch:
             progress_bar_epoch.set_description(f"[epoch {current_epoch:03d}]")
@@ -179,7 +184,7 @@ def main():
                 current_val_step = val_output.val_step
 
                 checkpoint_dict, _ = save_to_checkpoint(
-                    args.save_checkpoint_dir,
+                    cfg.checkpoint.save_dir,
                     current_epoch,
                     current_train_step,
                     current_val_step,
@@ -191,7 +196,7 @@ def main():
                 )
                 save_to_comet(
                     checkpoint_dict,
-                    args.model_name,
+                    cfg.model.name,
                     logger
                 )
 
