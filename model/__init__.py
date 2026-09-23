@@ -8,6 +8,7 @@ from .x3d import X3DM
 from .resnet import ResNet18, ResNet50  # pylint: disable=import-error
 from .abn import ABNResNet50
 from .vit import ViTb, ViTFrameEncoder
+from .masked_mean_clip_aggregator import MaskedMeanClipAggregator
 from .dummy_models import ZeroOutputModel
 
 from .model_factory import configure_model
@@ -26,6 +27,7 @@ __all__ = [
     'ABNResNet50',
     'ViTb',
     'ViTFrameEncoder',
+    'MaskedMeanClipAggregator',
     'ZeroOutputModel',
     'configure_model',
     'SimpleLightningModel',
