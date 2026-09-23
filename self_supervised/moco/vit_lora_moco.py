@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ..vit import ViTLoRAFrameEncoder
+from model.backbones.vit import ViTLoRAFrameEncoder
 
 
 FEATURE_SIZE = 768

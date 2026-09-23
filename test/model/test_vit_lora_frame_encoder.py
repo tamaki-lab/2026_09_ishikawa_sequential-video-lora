@@ -5,7 +5,7 @@ import torch
 from peft.tuners.lora import LoraLayer
 from transformers import ViTConfig, ViTModel
 
-from model import ViTLoRAFrameEncoder
+from model.backbones.vit import ViTLoRAFrameEncoder
 
 
 @pytest.fixture
@@ -13,7 +13,7 @@ def encoder(monkeypatch):
     # Real 12-layer, width-768 attention and PEFT; smaller MLP for offline unit tests.
     backbone = ViTModel(ViTConfig(intermediate_size=32), add_pooling_layer=False)
     load = Mock(return_value=backbone)
-    monkeypatch.setattr('model.vit.vit_lora_frame_encoder.ViTModel.from_pretrained', load)
+    monkeypatch.setattr('model.backbones.vit.vit_lora_frame_encoder.ViTModel.from_pretrained', load)
     model = ViTLoRAFrameEncoder()
     load.assert_called_once_with('google/vit-base-patch16-224', add_pooling_layer=False)
     return model

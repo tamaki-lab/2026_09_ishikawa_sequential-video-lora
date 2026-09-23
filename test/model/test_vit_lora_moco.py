@@ -2,8 +2,8 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from model.moco import MetadataQueue, ViTLoRAMoCo
-from model.moco.vit_lora_moco import lora_parameters
+from self_supervised.moco import MetadataQueue, ViTLoRAMoCo
+from self_supervised.moco.vit_lora_moco import lora_parameters
 from test_vit_lora_frame_encoder import encoder
 
 

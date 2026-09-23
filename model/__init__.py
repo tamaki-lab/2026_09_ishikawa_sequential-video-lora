@@ -4,11 +4,11 @@ from .base_model import (
     ClassificationBaseModel,
     get_device,
 )
-from .x3d import X3DM
-from .resnet import ResNet18, ResNet50  # pylint: disable=import-error
-from .abn import ABNResNet50
-from .vit import ViTb, ViTFrameEncoder, ViTLoRAFrameEncoder
-from .masked_mean_clip_aggregator import MaskedMeanClipAggregator
+from .backbones.x3d import X3DM
+from .backbones.resnet import ResNet18, ResNet50  # pylint: disable=import-error
+from .backbones.abn import ABNResNet50
+from .backbones.vit import ViTb, ViTFrameEncoder, ViTLoRAFrameEncoder
+from .aggregators import MaskedMeanClipAggregator
 from .dummy_models import ZeroOutputModel
 
 from .model_factory import configure_model

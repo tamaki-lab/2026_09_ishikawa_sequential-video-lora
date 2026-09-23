@@ -5,7 +5,8 @@ from torchvision.models import (
 
 )
 
-from model import ModelConfig, ClassificationBaseModel
+from model.model_config import ModelConfig
+from model.base_model import ClassificationBaseModel
 
 
 class ResNet50(ClassificationBaseModel):

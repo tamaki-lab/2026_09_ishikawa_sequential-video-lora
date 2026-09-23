@@ -6,7 +6,7 @@ import pytest
 import sequential_loader as sl
 import torch
 
-from model import MaskedMeanClipAggregator
+from model.aggregators import MaskedMeanClipAggregator
 from sequential_vit_bridge import encode_chunk
 from test_vit_lora_frame_encoder import encoder
 from test_activitynet_vit_clip_feature import RecordingProcessor, make_sample

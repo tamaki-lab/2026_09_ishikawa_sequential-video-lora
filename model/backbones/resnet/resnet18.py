@@ -4,7 +4,8 @@ from torchvision.models import (
     ResNet18_Weights,
 )
 
-from model import ModelConfig, ClassificationBaseModel
+from model.model_config import ModelConfig
+from model.base_model import ClassificationBaseModel
 
 
 class ResNet18(ClassificationBaseModel):

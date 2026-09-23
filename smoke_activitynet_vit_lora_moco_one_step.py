@@ -15,9 +15,9 @@ import torch
 import transformers
 from transformers import AutoImageProcessor
 
-from model import ViTLoRAFrameEncoder
-from model.moco import ViTLoRAMoCo
-from model.moco.vit_lora_moco import lora_parameters, require_normalized
+from model.backbones.vit import ViTLoRAFrameEncoder
+from self_supervised.moco import ViTLoRAMoCo
+from self_supervised.moco.vit_lora_moco import lora_parameters, require_normalized
 from sequential_moco_bridge import make_two_views, encode_query_view, encode_key_view
 from smoke_activitynet_vit_lora_one_step import (
     CHECKPOINT_ID, EXPECTED_BRANCH, LOADER_BRANCH, LOADER_COMMIT,

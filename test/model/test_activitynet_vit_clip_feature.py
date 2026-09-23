@@ -8,7 +8,7 @@ import sequential_loader as sl
 import torch
 from torch import nn
 
-from model import MaskedMeanClipAggregator
+from model.aggregators import MaskedMeanClipAggregator
 from sequential_vit_bridge import encode_chunk
 import smoke_activitynet_vit_clip_feature as smoke
 

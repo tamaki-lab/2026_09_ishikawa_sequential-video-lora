@@ -5,7 +5,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from model import ViTFrameEncoder
+from model.backbones.vit import ViTFrameEncoder
 
 
 class FakeViT(nn.Module):
@@ -22,7 +22,7 @@ class FakeViT(nn.Module):
 
 class TestViTFrameEncoder(unittest.TestCase):
     def test_cls_feature_and_frozen_backbone(self):
-        with patch('model.vit.vit_frame_encoder.ViTModel.from_pretrained', return_value=FakeViT()) as load:
+        with patch('model.backbones.vit.vit_frame_encoder.ViTModel.from_pretrained', return_value=FakeViT()) as load:
             encoder = ViTFrameEncoder()
 
         load.assert_called_once_with('google/vit-base-patch16-224', add_pooling_layer=False)

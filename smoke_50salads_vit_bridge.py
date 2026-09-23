@@ -12,7 +12,7 @@ import sequential_loader as sl
 import torch
 from transformers import AutoImageProcessor
 
-from model import ViTFrameEncoder
+from model.backbones.vit import ViTFrameEncoder
 from sequential_vit_bridge import encode_chunk
 
 

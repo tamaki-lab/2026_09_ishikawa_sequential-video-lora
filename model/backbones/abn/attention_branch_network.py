@@ -5,7 +5,8 @@ import torch
 from torch import nn
 from torch.nn.functional import adaptive_avg_pool2d
 
-from model import ModelConfig, ClassificationBaseModel, ModelOutput
+from model.model_config import ModelConfig
+from model.base_model import ClassificationBaseModel, ModelOutput
 
 
 class ABNResNet50(ClassificationBaseModel):

@@ -6,7 +6,7 @@ import torch
 from PIL import Image
 from transformers import AutoImageProcessor
 
-from model import ViTFrameEncoder
+from model.backbones.vit import ViTFrameEncoder
 
 
 CHECKPOINT_ID = "google/vit-base-patch16-224"

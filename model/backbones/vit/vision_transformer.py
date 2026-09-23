@@ -4,7 +4,8 @@ import torch
 
 from transformers import ViTForImageClassification
 
-from model import ModelConfig, ClassificationBaseModel, ModelOutput
+from model.model_config import ModelConfig
+from model.base_model import ClassificationBaseModel, ModelOutput
 
 
 class ViTb(ClassificationBaseModel):

@@ -1,15 +1,12 @@
 import os
 
-from model import (
-    ClassificationBaseModel,
-    ModelConfig,
-    ResNet50,
-    ResNet18,
-    ABNResNet50,
-    X3DM,
-    ViTb,
-    ZeroOutputModel,
-)
+from .base_model import ClassificationBaseModel
+from .model_config import ModelConfig
+from .backbones.resnet import ResNet50, ResNet18
+from .backbones.abn import ABNResNet50
+from .backbones.x3d import X3DM
+from .backbones.vit import ViTb
+from .dummy_models import ZeroOutputModel
 
 
 def set_torch_home(

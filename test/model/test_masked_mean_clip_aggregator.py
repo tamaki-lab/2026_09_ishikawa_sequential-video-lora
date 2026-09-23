@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from model import MaskedMeanClipAggregator
+from model.aggregators import MaskedMeanClipAggregator
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])

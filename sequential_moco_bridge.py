@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import torch
 
-from model import MaskedMeanClipAggregator
+from model.aggregators import MaskedMeanClipAggregator
 from sequential_vit_bridge import encode_chunk
 
 

@@ -15,7 +15,8 @@ import torch
 import transformers
 from transformers import AutoImageProcessor
 
-from model import MaskedMeanClipAggregator, ViTLoRAFrameEncoder
+from model.aggregators import MaskedMeanClipAggregator
+from model.backbones.vit import ViTLoRAFrameEncoder
 from sequential_vit_bridge import encode_chunk
 
 
