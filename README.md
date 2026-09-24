@@ -108,6 +108,23 @@ python3 main_pl.py --help
 VS Code の [launch.json](.vscode/launch.json) / [tasks.json](.vscode/tasks.json) も
 同じ Hydra override 形式を使用する．
 
+## Sequential bridge と smoke チェック
+
+`integration/` に `sequential_loader` と ViT / MoCo をつなぐ共通処理を置く．
+手動の動作確認スクリプトは `scripts/smoke/` に置く．リポジトリの
+ルートからモジュールとして実行する．
+
+```bash
+python3 -m scripts.smoke.smoke_vit_frame_encoder dog.jpg
+python3 -m scripts.smoke.smoke_activitynet_vit_clip_feature /path/to/ActivityNet
+python3 -m scripts.smoke.smoke_activitynet_vit_lora_moco_multistep /path/to/ActivityNet --max-steps 10
+```
+
+従来のルート直下の `smoke_*.py` は上記のモジュール実行に置き換える．
+`import sequential_*_bridge` は互換入口を通して利用できる．
+データセット，チェックポイント，Git revision に関する各スクリプトの
+検証条件は従来どおり．
+
 ## Comet の設定
 
 comet の設定は，

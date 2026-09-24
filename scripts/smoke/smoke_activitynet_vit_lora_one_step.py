@@ -1,7 +1,7 @@
 """Verify one engineering-only Q/V LoRA update on the first ActivityNet chunk.
 
 Usage:
-    python smoke_activitynet_vit_lora_one_step.py /path/to/ActivityNet
+    python -m scripts.smoke.smoke_activitynet_vit_lora_one_step /path/to/ActivityNet
 """
 
 import argparse
@@ -9,7 +9,6 @@ import subprocess
 from pathlib import Path
 
 import peft
-from peft.tuners.lora import LoraLayer
 import sequential_loader as sl
 import torch
 import transformers
@@ -17,7 +16,8 @@ from transformers import AutoImageProcessor
 
 from model.aggregators import MaskedMeanClipAggregator
 from model.backbones.vit import ViTLoRAFrameEncoder
-from sequential_vit_bridge import encode_chunk
+from integration.sequential_vit import encode_chunk
+from training.moco_audit import audit_encoder_parameters as audit_parameters
 
 
 CHECKPOINT_ID = "google/vit-base-patch16-224"
@@ -33,35 +33,6 @@ def git_output(repository: Path, *args: str) -> str:
     return subprocess.check_output(
         ["git", "-C", str(repository), *args], text=True
     ).strip()
-
-
-def audit_parameters(encoder):
-    """Require exactly the approved Q/V adapters before creating an optimizer."""
-    targets = [name for name, module in encoder.vit.named_modules() if isinstance(module, LoraLayer)]
-    q_count = sum(name.endswith('.q_proj') for name in targets)
-    v_count = sum(name.endswith('.v_proj') for name in targets)
-    pooler_none = encoder.vit.get_base_model().pooler is None
-    print(f"pooler is None: {pooler_none}")
-    print(f"LoRA target names: {targets}")
-    print(f"LoRA target count: {len(targets)}")
-    print(f"q_proj count: {q_count}")
-    print(f"v_proj count: {v_count}")
-    if not pooler_none or len(targets) != 24 or (q_count, v_count) != (12, 12):
-        raise RuntimeError("Expected no pooler and exactly 12 Q / 12 V LoRA targets")
-
-    parameters = dict(encoder.named_parameters())
-    lora = {name: p for name, p in parameters.items() if '.lora_A.' in name or '.lora_B.' in name}
-    base = {name: p for name, p in parameters.items() if name not in lora}
-    trainable = {name: p for name, p in parameters.items() if p.requires_grad}
-    unexpected = sorted(set(trainable) - set(lora))
-    count = sum(p.numel() for p in trainable.values())
-    print(f"total model parameters: {sum(p.numel() for p in parameters.values())}")
-    print(f"trainable parameters: {count}")
-    print(f"trainable tensor count: {len(trainable)}")
-    print(f"unexpected trainable names: {unexpected}")
-    if unexpected or set(trainable) != set(lora) or count != 294_912 or len(trainable) != 48:
-        raise RuntimeError("Expected exactly 294,912 trainable parameters in 48 LoRA tensors")
-    return base, lora
 
 
 def run_one_step(encoder, clip_feature):

@@ -16,7 +16,7 @@ from self_supervised.moco.vit_lora_moco import lora_parameters
 from test_activitynet_vit_clip_feature import RecordingProcessor
 from test_vit_lora_frame_encoder import encoder
 import training.moco_canary as canary
-import smoke_activitynet_vit_lora_moco_multistep as smoke
+from scripts.smoke import smoke_activitynet_vit_lora_moco_multistep as smoke
 
 
 @pytest.fixture

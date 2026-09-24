@@ -1,7 +1,7 @@
 """Verify MoCo mechanics on the first chunks of two ActivityNet training videos.
 
 Usage:
-    python smoke_activitynet_vit_lora_moco_one_step.py /path/to/ActivityNet
+    python -m scripts.smoke.smoke_activitynet_vit_lora_moco_one_step /path/to/ActivityNet
 
 This performs one CPU-default engineering step, not representation evaluation.
 """
@@ -17,11 +17,12 @@ from transformers import AutoImageProcessor
 
 from model.backbones.vit import ViTLoRAFrameEncoder
 from self_supervised.moco import ViTLoRAMoCo
-from self_supervised.moco.vit_lora_moco import lora_parameters, require_normalized
-from sequential_moco_bridge import make_two_views, encode_query_view, encode_key_view
-from smoke_activitynet_vit_lora_one_step import (
+from self_supervised.moco.vit_lora_moco import require_normalized
+from integration.sequential_moco import make_two_views, encode_query_view, encode_key_view
+from training.moco_audit import audit_initial_state, audit_parameters, audit_views, parameter_groups
+from .smoke_activitynet_vit_lora_one_step import (
     CHECKPOINT_ID, EXPECTED_BRANCH, LOADER_BRANCH, LOADER_COMMIT,
-    FRAMES_PER_CHUNK, audit_parameters as audit_encoder, git_output,
+    FRAMES_PER_CHUNK, git_output,
 )
 
 
@@ -58,71 +59,6 @@ def audit_provenance():
     print(f'PyTorch / Transformers / PEFT: {torch.__version__} / {transformers.__version__} / {peft.__version__}')
 
 
-def parameter_groups(moco):
-    groups = {}
-    for side in ('query', 'key'):
-        encoder = getattr(moco, f'{side}_encoder')
-        lora = lora_parameters(encoder)
-        groups[f'{side} base'] = {
-            f'{side}_encoder.{name}': p for name, p in encoder.named_parameters() if name not in lora
-        }
-        groups[f'{side} LoRA'] = {f'{side}_encoder.{name}': p for name, p in lora.items()}
-        groups[f'{side} Projector'] = {
-            f'{side}_projector.{name}': p for name, p in getattr(moco, f'{side}_projector').named_parameters()
-        }
-    return groups
-
-
-def audit_parameters(moco):
-    audit_encoder(moco.query_encoder)
-    for side in ('query', 'key'):
-        encoder = getattr(moco, f'{side}_encoder')
-        config = encoder.vit.peft_config['default']
-        if config.target_modules != {'q_proj', 'v_proj'} or (
-            config.r, config.lora_alpha, config.lora_dropout, config.bias
-        ) != (8, 8, 0.0, 'none'):
-            raise RuntimeError(f'Unexpected {side} LoRA configuration')
-        projector = getattr(moco, f'{side}_projector')
-        if len(projector) != 3 or not isinstance(projector[0], torch.nn.Linear) or not isinstance(
-            projector[1], torch.nn.ReLU
-        ) or not isinstance(projector[2], torch.nn.Linear):
-            raise RuntimeError('Expected Linear / ReLU / Linear projector')
-        if (projector[0].in_features, projector[0].out_features,
-            projector[2].in_features, projector[2].out_features) != (768, 768, 768, 128):
-            raise RuntimeError('Expected 768 -> 768 -> 128 projector')
-    groups = parameter_groups(moco)
-    for side in ('query', 'key'):
-        for kind, count, tensors in (('LoRA', 294_912, 48), ('Projector', 689_024, 4)):
-            parameters = groups[f'{side} {kind}']
-            actual = sum(p.numel() for p in parameters.values())
-            print(f'{side} {kind} params / tensors: {actual} / {len(parameters)}')
-            if (actual, len(parameters)) != (count, tensors):
-                raise RuntimeError(f'Unexpected {side} {kind} parameter count')
-    expected = {**groups['query LoRA'], **groups['query Projector']}
-    trainable = {name: p for name, p in moco.named_parameters() if p.requires_grad}
-    if set(trainable) != set(expected):
-        raise RuntimeError('Only Query LoRA and Query Projector may be trainable')
-    if (moco.momentum, moco.temperature, moco.queue.capacity) != (0.999, 0.07, 4096):
-        raise RuntimeError('Unexpected momentum, temperature or queue capacity')
-    return groups
-
-
-def audit_initial_state(moco):
-    audit_parameters(moco)
-    for query, key in ((moco.query_encoder, moco.key_encoder), (moco.query_projector, moco.key_projector)):
-        query_state, key_state = query.state_dict(), key.state_dict()
-        if query_state.keys() != key_state.keys() or any(
-            not torch.equal(query_state[name], key_state[name]) for name in query_state
-        ):
-            raise RuntimeError('Query / Key initial states differ')
-        key_parameters = dict(key.named_parameters())
-        if any(p.data_ptr() == key_parameters[name].data_ptr() for name, p in query.named_parameters()):
-            raise RuntimeError('Query / Key parameters must have independent storage')
-    if len(moco.queue) != 0:
-        raise RuntimeError('Queue must start empty')
-    print('Query / Key initial states equal, independent storage: True')
-
-
 def read_first_chunk(source):
     dataset = sl.SequentialDataset(
         sources=(source,), reader=sl.SequentialVideoReader(),
@@ -152,19 +88,6 @@ def report_sample(label, sample):
     print(f'{label} frame_indices: {sample.frame_indices.tolist()}')
     print(f'{label} timestamps: {sample.timestamps.tolist()}')
     print(f'{label} valid count / T: {int(sample.valid_mask.sum())}/16')
-
-
-def audit_views(sample, query, key):
-    for view in (query, key):
-        if (view.sequence_id, view.sequence_index) != (sample.sequence_id, sample.sequence_index):
-            raise RuntimeError('Two-view sequence metadata differs')
-        for name in ('frame_indices', 'valid_mask', 'timestamps'):
-            if not torch.allclose(getattr(view, name), getattr(sample, name), rtol=0, atol=0, equal_nan=True):
-                raise RuntimeError(f'Two-view {name} differs')
-    if not torch.equal(query.frames, sample.frames) or not torch.equal(
-        key.frames[sample.valid_mask], sample.frames[sample.valid_mask].flip(-1)
-    ) or not torch.equal(key.frames[~sample.valid_mask], sample.frames[~sample.valid_mask]):
-        raise RuntimeError('Expected raw Query and valid-frame horizontal-flip Key')
 
 
 def report_features(label, result, sample):

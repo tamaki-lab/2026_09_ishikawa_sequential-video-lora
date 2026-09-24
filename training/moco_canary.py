@@ -7,8 +7,8 @@ import sequential_loader as sl
 import torch
 
 from self_supervised.moco.vit_lora_moco import require_normalized
-from sequential_moco_bridge import make_two_views, encode_query_view, encode_key_view
-from smoke_activitynet_vit_lora_moco_one_step import (
+from integration.sequential_moco import make_two_views, encode_query_view, encode_key_view
+from training.moco_audit import (
     audit_initial_state, audit_views, parameter_groups,
 )
 

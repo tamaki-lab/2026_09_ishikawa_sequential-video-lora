@@ -1,8 +1,8 @@
 """Stage 6A: four-stream MoCo smoke / canary, each invocation a fresh run.
 
 Usage:
-    python smoke_activitynet_vit_lora_moco_multistep.py /path/to/ActivityNet --max-steps 10
-    python smoke_activitynet_vit_lora_moco_multistep.py /path/to/ActivityNet --max-steps 100
+    python -m scripts.smoke.smoke_activitynet_vit_lora_moco_multistep /path/to/ActivityNet --max-steps 10
+    python -m scripts.smoke.smoke_activitynet_vit_lora_moco_multistep /path/to/ActivityNet --max-steps 100
 """
 
 import argparse
@@ -14,8 +14,8 @@ from transformers import AutoImageProcessor
 
 from model.backbones.vit import ViTLoRAFrameEncoder
 from self_supervised.moco import ViTLoRAMoCo
-from smoke_activitynet_vit_lora_moco_one_step import audit_provenance
-from smoke_activitynet_vit_lora_one_step import CHECKPOINT_ID, git_output
+from .smoke_activitynet_vit_lora_moco_one_step import audit_provenance
+from .smoke_activitynet_vit_lora_one_step import CHECKPOINT_ID, git_output
 from training.moco_canary import run_canary, validate_sources
 
 

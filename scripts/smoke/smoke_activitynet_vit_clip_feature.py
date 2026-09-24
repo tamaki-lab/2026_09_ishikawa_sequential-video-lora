@@ -1,7 +1,7 @@
-"""Encode one 50Salads train1 chunk with the frozen ViT frame encoder.
+"""Encode the first ActivityNet training chunk with frozen ViT and masked mean.
 
 Usage:
-    python smoke_50salads_vit_bridge.py /path/to/50Salads
+    python -m scripts.smoke.smoke_activitynet_vit_clip_feature /path/to/ActivityNet
 """
 
 import argparse
@@ -12,15 +12,17 @@ import sequential_loader as sl
 import torch
 from transformers import AutoImageProcessor
 
+from model.aggregators import MaskedMeanClipAggregator
 from model.backbones.vit import ViTFrameEncoder
-from sequential_vit_bridge import encode_chunk
+from integration.sequential_vit import encode_chunk
 
 
 CHECKPOINT_ID = "google/vit-base-patch16-224"
-EXPECTED_BRANCH = "feature-50salads-loder"
-BASE_COMMIT = "e7e037a9191f36b26e87f80f48caccfb35b6166d"
-LOADER_COMMIT = "cef09aa12560127451a5f569d86d5d51671e6986"
+EXPECTED_BRANCH = "dev"
+BASE_COMMIT = "3c0e40e86924ceb38931c2d5214ecf3251a8f99d"
+LOADER_COMMIT = "19a0ed7e4c00300214bc9a2fe12da8c72c0499c0"
 FRAMES_PER_CHUNK = 16
+FEATURE_SIZE = 768
 
 
 def git_output(repository: Path, *args: str) -> str:
@@ -31,24 +33,27 @@ def git_output(repository: Path, *args: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("dataset_root", type=Path, help="Path to the 50Salads dataset root")
+    parser.add_argument("dataset_root", type=Path, help="Path to the ActivityNet dataset root")
     args = parser.parse_args()
 
     implementation_root = Path(__file__).resolve().parent
     branch = git_output(implementation_root, "branch", "--show-current")
     if branch != EXPECTED_BRANCH:
         raise RuntimeError(f"Expected branch {EXPECTED_BRANCH}, got {branch}")
-    branch_base = git_output(implementation_root, "merge-base", "HEAD", "main")
-    if branch_base != BASE_COMMIT:
-        raise RuntimeError(f"Expected branch base {BASE_COMMIT}, got {branch_base}")
+    implementation_revision = git_output(implementation_root, "rev-parse", "HEAD")
+    git_output(implementation_root, "merge-base", "--is-ancestor", BASE_COMMIT, "HEAD")
 
     loader_root = Path(sl.__file__).resolve().parent.parent
-    loader_revision = git_output(loader_root, "rev-parse", "HEAD") if (loader_root / ".git").exists() else "unavailable"
-    if loader_revision != "unavailable" and loader_revision != LOADER_COMMIT:
+    loader_revision = git_output(loader_root, "rev-parse", "HEAD")
+    if loader_revision != LOADER_COMMIT:
         raise RuntimeError(f"Expected sequential_loader revision {LOADER_COMMIT}, got {loader_revision}")
+    if git_output(loader_root, "status", "--porcelain", "--untracked-files=no"):
+        raise RuntimeError("Pinned sequential_loader checkout has tracked changes")
 
-    adapter = sl.Salads50Adapter(dataset_root=args.dataset_root)
-    sources = adapter.sequence_sources("train1")
+    adapter = sl.ActivityNetAdapter(dataset_root=args.dataset_root)
+    sources = adapter.sequence_sources("training")
+    if not sources:
+        raise RuntimeError("ActivityNet training subset has no sources")
     dataset = sl.SequentialDataset(
         sources=sources,
         reader=sl.SequentialVideoReader(),
@@ -62,12 +67,19 @@ def main():
         raise RuntimeError(f"Expected SequentialSample, got {type(sample).__name__}")
     if sample.sequence_id != sources[0].sequence_id or sample.sequence_index != 0 or not sample.is_first:
         raise RuntimeError("First sample does not match the first source and first chunk")
-    if tuple(sample.frames.shape[:2]) != (FRAMES_PER_CHUNK, 3):
+    if sample.frames.ndim != 4 or tuple(sample.frames.shape[:2]) != (FRAMES_PER_CHUNK, 3):
         raise RuntimeError(f"Unexpected frames shape: {tuple(sample.frames.shape)}")
     if sample.frames.device.type != "cpu" or sample.frames.dtype != torch.uint8:
         raise RuntimeError("frames must be CPU uint8")
-    if tuple(sample.valid_mask.shape) != (FRAMES_PER_CHUNK,):
-        raise RuntimeError(f"Unexpected valid_mask shape: {tuple(sample.valid_mask.shape)}")
+    if tuple(sample.valid_mask.shape) != (FRAMES_PER_CHUNK,) or sample.valid_mask.dtype != torch.bool:
+        raise RuntimeError("valid_mask must be bool [16]")
+    valid_count = int(sample.valid_mask.sum().item())
+    if valid_count == 0:
+        raise RuntimeError("SequentialSample has no valid frames")
+    if not torch.equal(sample.frame_indices[sample.valid_mask], torch.arange(valid_count)):
+        raise RuntimeError("First chunk must contain contiguous frame indices starting at zero")
+    original_indices = sample.frame_indices.clone()
+    original_timestamps = sample.timestamps.clone()
 
     processor = AutoImageProcessor.from_pretrained(CHECKPOINT_ID)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -78,35 +90,50 @@ def main():
         raise RuntimeError(f"Backbone has {trainable_parameters} trainable parameters")
 
     encoder.eval()
+    aggregator = MaskedMeanClipAggregator()
     with torch.no_grad():
         pixel_values, valid_features, frame_features = encode_chunk(sample, processor, encoder, device)
+        clip_feature = aggregator(frame_features, sample.valid_mask)
 
-    feature_finite = bool(torch.isfinite(frame_features).all().item())
+    if tuple(frame_features.shape) != (FRAMES_PER_CHUNK, FEATURE_SIZE):
+        raise RuntimeError(f"Unexpected frame_features shape: {tuple(frame_features.shape)}")
+    if tuple(clip_feature.shape) != (FEATURE_SIZE,):
+        raise RuntimeError(f"Unexpected clip_feature shape: {tuple(clip_feature.shape)}")
+    frame_finite = bool(torch.isfinite(frame_features).all().item())
+    clip_finite = bool(torch.isfinite(clip_feature).all().item())
     padding_zero = bool(torch.all(frame_features[~sample.valid_mask.to(device)] == 0).item())
-    if not feature_finite or not padding_zero:
-        raise RuntimeError("Frame features failed finite or padding check")
+    if not frame_finite or not clip_finite or not padding_zero:
+        raise RuntimeError("Clip features failed finite or padding check")
+    if not torch.equal(sample.frame_indices, original_indices) or not torch.allclose(
+        sample.timestamps, original_timestamps, rtol=0, atol=0, equal_nan=True
+    ):
+        raise RuntimeError("Frame metadata alignment changed during encoding")
 
     print(f"implementation branch: {branch}")
-    print(f"branch base: {branch_base}")
-    print(f"sequential_loader revision: {loader_revision} (expected {LOADER_COMMIT})")
+    print(f"implementation revision: {implementation_revision}")
+    print(f"implementation base: {BASE_COMMIT}")
+    print(f"sequential_loader revision: {loader_revision}")
     print(f"checkpoint ID: {CHECKPOINT_ID}")
     print(f"resolved device: {device}")
+    print("dataset: ActivityNet v1.3")
+    print("split: training")
+    print(f"training sources: {len(sources)}")
     print(f"sequence_id: {sample.sequence_id}")
     print(f"sequence_index: {sample.sequence_index}")
     print(f"is_first: {sample.is_first}")
     print(f"is_last: {sample.is_last}")
     print(f"frames shape: {tuple(sample.frames.shape)}")
     print(f"frames dtype: {sample.frames.dtype}")
-    print(f"valid count / T: {int(sample.valid_mask.sum().item())}/{sample.frames.shape[0]}")
+    print(f"valid count / T: {valid_count}/{sample.frames.shape[0]}")
     print(f"valid_mask: {sample.valid_mask.tolist()}")
     print(f"frame_indices: {sample.frame_indices.tolist()}")
     print(f"timestamps: {sample.timestamps.tolist()}")
     print(f"pixel_values shape: {tuple(pixel_values.shape)}")
-    print(f"pixel_values dtype: {pixel_values.dtype}")
-    print(f"valid feature shape: {tuple(valid_features.shape)}")
+    print(f"valid_features shape: {tuple(valid_features.shape)}")
     print(f"frame_features shape: {tuple(frame_features.shape)}")
-    print(f"frame_features dtype: {frame_features.dtype}")
-    print(f"feature finite: {feature_finite}")
+    print(f"clip_feature shape: {tuple(clip_feature.shape)}")
+    print(f"frame feature finite: {frame_finite}")
+    print(f"clip feature finite: {clip_finite}")
     print(f"padding rows zero: {padding_zero}")
     print(f"total backbone parameters: {total_parameters}")
     print(f"trainable backbone parameters: {trainable_parameters}")

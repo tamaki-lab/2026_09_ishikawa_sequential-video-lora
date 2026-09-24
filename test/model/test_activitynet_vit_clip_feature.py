@@ -10,7 +10,7 @@ from torch import nn
 
 from model.aggregators import MaskedMeanClipAggregator
 from sequential_vit_bridge import encode_chunk
-import smoke_activitynet_vit_clip_feature as smoke
+from scripts.smoke import smoke_activitynet_vit_clip_feature as smoke
 
 
 class RecordingProcessor:

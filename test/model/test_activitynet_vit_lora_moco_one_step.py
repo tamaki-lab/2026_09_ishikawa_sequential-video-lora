@@ -10,7 +10,7 @@ from sequential_moco_bridge import make_two_views, encode_query_view, encode_key
 from test_activitynet_vit_clip_feature import RecordingProcessor, make_sample
 from test_vit_lora_frame_encoder import encoder
 from test_vit_lora_moco import moco, unit_key
-import smoke_activitynet_vit_lora_moco_one_step as smoke
+from scripts.smoke import smoke_activitynet_vit_lora_moco_one_step as smoke
 
 
 def asymmetric_sample():

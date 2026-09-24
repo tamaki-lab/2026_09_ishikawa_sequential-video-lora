@@ -10,7 +10,7 @@ from model.aggregators import MaskedMeanClipAggregator
 from sequential_vit_bridge import encode_chunk
 from test_vit_lora_frame_encoder import encoder
 from test_activitynet_vit_clip_feature import RecordingProcessor, make_sample
-import smoke_activitynet_vit_lora_one_step as smoke
+from scripts.smoke import smoke_activitynet_vit_lora_one_step as smoke
 
 
 def test_one_step_through_valid_scatter_and_masked_mean(encoder, monkeypatch, capsys):
