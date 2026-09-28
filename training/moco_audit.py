@@ -100,14 +100,23 @@ def audit_initial_state(moco):
     print('Query / Key initial states equal, independent storage: True')
 
 
-def audit_views(sample, query, key):
+def audit_views(sample, query, key, key_transform='horizontal_flip'):
+    if key_transform not in ('horizontal_flip', 'gbr_horizontal_flip'):
+        raise ValueError(f'Unknown key_transform: {key_transform}')
     for view in (query, key):
-        if (view.sequence_id, view.sequence_index) != (sample.sequence_id, sample.sequence_index):
-            raise RuntimeError('Two-view sequence metadata differs')
+        for name in ('sequence_id', 'sequence_index', 'source_id', 'is_first', 'is_last', 'sequence_length'):
+            if getattr(view, name) != getattr(sample, name):
+                raise RuntimeError(f'Two-view {name} differs')
+        for name in ('source_metadata', 'dataset_metadata', 'evaluation_reference'):
+            if getattr(view, name) is not getattr(sample, name):
+                raise RuntimeError(f'Two-view {name} differs')
         for name in ('frame_indices', 'valid_mask', 'timestamps'):
             if not torch.allclose(getattr(view, name), getattr(sample, name), rtol=0, atol=0, equal_nan=True):
                 raise RuntimeError(f'Two-view {name} differs')
+    expected = sample.frames[sample.valid_mask]
+    if key_transform == 'gbr_horizontal_flip':
+        expected = expected[:, [1, 2, 0]]
     if not torch.equal(query.frames, sample.frames) or not torch.equal(
-        key.frames[sample.valid_mask], sample.frames[sample.valid_mask].flip(-1)
+        key.frames[sample.valid_mask], expected.flip(-1)
     ) or not torch.equal(key.frames[~sample.valid_mask], sample.frames[~sample.valid_mask]):
-        raise RuntimeError('Expected raw Query and valid-frame horizontal-flip Key')
+        raise RuntimeError(f'Expected raw Query and valid-frame {key_transform} Key')

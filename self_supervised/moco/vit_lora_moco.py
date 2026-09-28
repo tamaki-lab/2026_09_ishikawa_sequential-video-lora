@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from model.backbones.vit import ViTLoRAFrameEncoder
+from .negative_selection import select_negatives
 
 
 FEATURE_SIZE = 768
@@ -40,7 +41,7 @@ class QueueEntry:
 
 
 class MetadataQueue:
-    """Empty FIFO of detached keys; filter same-video entries at read time."""
+    """FIFO storage of detached keys and their source metadata."""
 
     def __init__(self, capacity=QUEUE_CAPACITY):
         if not isinstance(capacity, int) or capacity <= 0:
@@ -64,10 +65,8 @@ class MetadataQueue:
         self._entries.append(QueueEntry(key.detach().clone(), sequence_id, sequence_index))
 
     def negatives(self, sequence_id):
-        entries = tuple(entry for entry in self._entries if entry.sequence_id != sequence_id)
-        if not entries:
-            raise RuntimeError('No valid different-sequence negatives in the queue')
-        return entries
+        """Legacy Stage 5 convenience; streaming policy lives in the selector."""
+        return select_negatives(self.entries, sequence_id)
 
 
 class ViTLoRAMoCo(nn.Module):
@@ -107,12 +106,14 @@ class ViTLoRAMoCo(nn.Module):
         require_normalized(k)
         return k
 
-    def contrastive_loss(self, query, positive_key, sequence_id):
+    def contrastive_loss(self, query, positive_key, sequence_id, *, negatives=None):
         require_normalized(query)
         require_normalized(positive_key)
-        entries = self.queue.negatives(sequence_id)
-        negatives = torch.stack([entry.key for entry in entries])
-        similarities = torch.cat(((query @ positive_key.detach()).reshape(1), negatives @ query))
+        entries = self.queue.negatives(sequence_id) if negatives is None else tuple(negatives)
+        if not entries:
+            raise RuntimeError('No valid negatives supplied for InfoNCE')
+        negative_keys = torch.stack([entry.key.detach() for entry in entries])
+        similarities = torch.cat(((query @ positive_key.detach()).reshape(1), negative_keys @ query))
         logits = similarities.unsqueeze(0) / self.temperature
         loss = F.cross_entropy(logits, torch.zeros(1, dtype=torch.long, device=query.device))
         if not torch.isfinite(logits).all().item() or not torch.isfinite(loss).item():

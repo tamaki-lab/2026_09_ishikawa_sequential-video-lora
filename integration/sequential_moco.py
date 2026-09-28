@@ -8,10 +8,15 @@ from model.aggregators import MaskedMeanClipAggregator
 from .sequential_vit import encode_chunk
 
 
-def make_two_views(sample):
-    """Keep Query raw; flip every valid Key frame along width, without mutation."""
+def make_two_views(sample, key_transform='horizontal_flip'):
+    """Keep Query raw; transform valid Key frames without changing the source."""
+    if key_transform not in ('horizontal_flip', 'gbr_horizontal_flip'):
+        raise ValueError(f'Unknown key_transform: {key_transform}')
     key_frames = sample.frames.clone()
-    key_frames[sample.valid_mask] = sample.frames[sample.valid_mask].flip(-1)
+    valid_frames = sample.frames[sample.valid_mask]
+    if key_transform == 'gbr_horizontal_flip':
+        valid_frames = valid_frames[:, [1, 2, 0]]
+    key_frames[sample.valid_mask] = valid_frames.flip(-1)
     return sample, replace(sample, frames=key_frames)
 
 
