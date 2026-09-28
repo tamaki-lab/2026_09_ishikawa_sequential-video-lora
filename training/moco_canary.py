@@ -1,5 +1,6 @@
-"""Four chronological streams and audited, finite-length Stage 6A MoCo updates."""
+"""Ordered streams and a shared, audited Streaming MoCo training engine."""
 
+from collections import deque
 from contextlib import ExitStack, contextmanager
 import json
 
@@ -7,6 +8,8 @@ import sequential_loader as sl
 import torch
 
 from self_supervised.moco.vit_lora_moco import require_normalized
+from self_supervised.moco.negative_selection import select_negatives
+from training.moco_protocol import StreamingMoCoProtocol, STAGE6A_PROTOCOL
 from integration.sequential_moco import make_two_views, encode_query_view, encode_key_view
 from training.moco_audit import (
     audit_initial_state, audit_views, parameter_groups,
@@ -17,19 +20,21 @@ FRAMES_PER_CHUNK = 16
 STREAM_COUNT = 4
 
 
-def validate_sources(sources):
-    if len(sources) != STREAM_COUNT or len({source.sequence_id for source in sources}) != STREAM_COUNT:
-        raise ValueError('Expected exactly four distinct sources')
+def validate_sources(sources, stream_mode='round_robin'):
+    count = StreamingMoCoProtocol(stream_mode=stream_mode).source_count
+    if len(sources) != count or len({source.sequence_id for source in sources}) != count:
+        description = 'four distinct sources' if count == 4 else 'one source for strict_single'
+        raise ValueError(f'Expected exactly {description}')
 
 
 @contextmanager
-def round_robin_samples(sources):
-    """Yield A1/B1/C1/D1/A2/... without prefetch; close all readers on every exit.
+def ordered_samples(sources, stream_mode='round_robin'):
+    """Yield one or four chronological streams without prefetch; always close readers.
 
     A final sample is consumed normally, then the whole iterator ends, even if
     the other streams still have samples. Timestamps retain their raw ordering.
     """
-    validate_sources(sources)
+    validate_sources(sources, stream_mode)
     with ExitStack() as stack:
         streams = []
         for source in sources:
@@ -52,7 +57,7 @@ def round_robin_samples(sources):
                     if (sample.sequence_id, sample.sequence_index, sample.is_first) != (
                         source.sequence_id, index, index == 0
                     ):
-                        raise RuntimeError('Round-robin sequence identity or chronological chunk order changed')
+                        raise RuntimeError('Stream sequence identity or chronological chunk order changed')
                     if sample.frames.ndim != 4 or tuple(sample.frames.shape[:2]) != (16, 3):
                         raise RuntimeError('Expected 16 RGB frames including padding')
                     if sample.frames.device.type != 'cpu' or sample.frames.dtype != torch.uint8:
@@ -77,6 +82,11 @@ def round_robin_samples(sources):
             yield samples
         finally:
             samples.close()
+
+
+def round_robin_samples(sources):
+    """Historical Stage 6A scheduling entry point."""
+    return ordered_samples(sources, stream_mode='round_robin')
 
 
 def _report(event, **values):
@@ -105,7 +115,7 @@ def _audit_finite(moco):
 def _audit_queue(moco, expected):
     entries = moco.queue.entries
     if len(entries) != len(expected):
-        raise RuntimeError('Queue count changed unexpectedly or eviction occurred')
+        raise RuntimeError('Queue count does not match the retained FIFO history')
     for entry, (sequence_id, sequence_index, key) in zip(entries, expected):
         require_normalized(entry.key)
         if entry.key.requires_grad or entry.key.grad_fn is not None:
@@ -142,9 +152,9 @@ def _gradient_diagnostics(groups):
     return diagnostics
 
 
-def _train_step(moco, processor, sample, device, optimizer, groups, before, expected_queue, step):
-    query_view, key_view = make_two_views(sample)
-    audit_views(sample, query_view, key_view)
+def _train_step(moco, processor, sample, device, optimizer, groups, before, expected_queue, step, protocol):
+    query_view, key_view = make_two_views(sample, protocol.key_transform)
+    audit_views(sample, query_view, key_view, protocol.key_transform)
     optimizer.zero_grad(set_to_none=True)
     query = encode_query_view(query_view, processor, moco, device)[-1]
     key = encode_key_view(key_view, processor, moco, device)[-1]
@@ -153,14 +163,14 @@ def _train_step(moco, processor, sample, device, optimizer, groups, before, expe
         raise RuntimeError('Current Key must be detached')
     _audit_queue(moco, expected_queue)
     old_entries = moco.queue.entries
-    expected_negatives = tuple(entry for entry in old_entries if entry.sequence_id != sample.sequence_id)
-    if len(expected_negatives) < 3:
-        raise RuntimeError('Expected at least three different-sequence negatives')
-    loss, logits, negatives = moco.contrastive_loss(query, key, sample.sequence_id)
+    expected_negatives = select_negatives(old_entries, sample.sequence_id, protocol.negative_policy)
+    loss, logits, negatives = moco.contrastive_loss(
+        query, key, sample.sequence_id, negatives=expected_negatives,
+    )
     if len(negatives) != len(expected_negatives) or any(
         actual is not original for actual, original in zip(negatives, expected_negatives)
     ):
-        raise RuntimeError('Negatives must exactly match the different-sequence entries in the old queue')
+        raise RuntimeError('Negatives must exactly match the selected entries in the old queue')
     if loss.ndim != 0 or tuple(logits.shape) != (1, 1 + len(negatives)) or not (
         torch.isfinite(loss).item() and torch.isfinite(logits).all().item()
     ):
@@ -196,26 +206,26 @@ def _train_step(moco, processor, sample, device, optimizer, groups, before, expe
     )
 
 
-def run_canary(moco, processor, sources, device, max_steps=10):
-    """Start fresh, warm up four keys, then perform exactly max_steps updates.
+def run_streaming_moco(moco, processor, sources, device, max_steps=10, *, protocol=STAGE6A_PROTOCOL):
+    """Start fresh, warm up each active stream, then perform max_steps updates.
 
     EOF before the target raises rather than reporting a successful canary.
     Models, queues and optimizers are never resumed across calls.
     """
-    validate_sources(sources)
-    if type(max_steps) is not int or not 1 <= max_steps <= moco.queue.capacity - STREAM_COUNT:
-        raise ValueError('max_steps must be a positive integer fitting the queue without eviction')
+    validate_sources(sources, protocol.stream_mode)
+    if type(max_steps) is not int or max_steps < 1:
+        raise ValueError('max_steps must be a positive integer')
     audit_initial_state(moco)
     groups = parameter_groups(moco)
     _audit_finite(moco)
     if any(p.grad is not None for p in moco.parameters()):
         raise RuntimeError('Fresh model must have no gradients')
     before = _snapshot(dict(moco.named_parameters()))
-    expected_queue = []
+    expected_queue = deque(maxlen=moco.queue.capacity)
     completed = 0
     last_sample = None
     try:
-        with round_robin_samples(sources) as samples:
+        with ordered_samples(sources, protocol.stream_mode) as samples:
             def take_sample():
                 nonlocal last_sample
                 sample = next(samples, None)
@@ -225,16 +235,16 @@ def run_canary(moco, processor, sources, device, max_steps=10):
                 last_sample = sample
                 return sample
 
-            for _ in range(STREAM_COUNT):
+            for _ in range(protocol.warmup_count):
                 sample = take_sample()
-                query_view, key_view = make_two_views(sample)
-                audit_views(sample, query_view, key_view)
+                query_view, key_view = make_two_views(sample, protocol.key_transform)
+                audit_views(sample, query_view, key_view, protocol.key_transform)
                 key = encode_key_view(key_view, processor, moco, device)[-1]
                 _enqueue(moco, key, sample, expected_queue)
                 _report('warmup', sequence_id=sample.sequence_id, sequence_index=sample.sequence_index,
                         valid_frame_count=int(sample.valid_mask.sum().item()), queue_count=len(moco.queue))
-            if len(moco.queue) != STREAM_COUNT:
-                raise RuntimeError('Expected exactly four warm-up keys')
+            if len(moco.queue) != protocol.warmup_count:
+                raise RuntimeError('Expected one warm-up key per active stream')
             if _changed(dict(moco.named_parameters()), before) or any(p.grad is not None for p in moco.parameters()):
                 raise RuntimeError('Warm-up must not change model parameters or create gradients')
             _report('warmup_complete', queue_count=len(moco.queue))
@@ -247,7 +257,7 @@ def run_canary(moco, processor, sources, device, max_steps=10):
                     matches_query_lora_and_projector=True, lr=1e-3, weight_decay=0.0)
             for step in range(max_steps):
                 sample = take_sample()
-                _train_step(moco, processor, sample, device, optimizer, groups, before, expected_queue, step)
+                _train_step(moco, processor, sample, device, optimizer, groups, before, expected_queue, step, protocol)
                 completed += 1
         _audit_bases(groups, before)
         _audit_finite(moco)
@@ -262,3 +272,11 @@ def run_canary(moco, processor, sources, device, max_steps=10):
     except Exception as error:
         _report('stopped', training_steps=completed, max_steps=max_steps, reason=str(error))
         raise
+
+
+def run_canary(moco, processor, sources, device, max_steps=10):
+    """Stage 6A compatibility entry point, retaining its no-eviction step bound."""
+    validate_sources(sources)
+    if type(max_steps) is not int or not 1 <= max_steps <= moco.queue.capacity - STREAM_COUNT:
+        raise ValueError('max_steps must be a positive integer fitting the queue without eviction')
+    return run_streaming_moco(moco, processor, sources, device, max_steps, protocol=STAGE6A_PROTOCOL)

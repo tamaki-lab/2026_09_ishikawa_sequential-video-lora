@@ -195,12 +195,12 @@ def test_multistep_real_moco_semantics_with_small_encoder(small_moco, sources, r
                 query = dict(moco.named_parameters())[name.replace('key_', 'query_', 1)]
                 torch.testing.assert_close(p, old[name] * .999 + query.detach() * .001, rtol=1e-6, atol=1e-8)
 
-    def compute_loss(query, key, sequence_id):
+    def compute_loss(query, key, sequence_id, *, negatives=None):
         events.append('loss')
         step = len(positive_keys)
         assert len(moco.queue) == 4 + step
         positive_keys.append(key.clone())
-        loss, logits, negatives = loss_fn(query, key, sequence_id)
+        loss, logits, negatives = loss_fn(query, key, sequence_id, negatives=negatives)
         assert len(negatives) >= 3 and all(entry.sequence_id != sequence_id for entry in negatives)
         assert all(entry is existing for entry, existing in zip(negatives, moco.queue.negatives(sequence_id)))
         loss.register_hook(lambda grad: events.append('backward'))
@@ -348,8 +348,8 @@ def test_audits_stop_invalid_training(small_moco, sources, reader, monkeypatch, 
     else:
         original = moco.contrastive_loss
 
-        def loss(query, key, sequence_id):
-            value, logits, negatives = original(query, key, sequence_id)
+        def loss(query, key, sequence_id, *, negatives=None):
+            value, logits, negatives = original(query, key, sequence_id, negatives=negatives)
             if failure == 'same_sequence':
                 negatives = moco.queue.entries
             elif failure == 'current_positive':
