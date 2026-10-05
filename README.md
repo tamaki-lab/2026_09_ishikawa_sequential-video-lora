@@ -1,6 +1,25 @@
-# A simple CNN/ViT training code
+# Sequential Video LoRA
 
-CNN/ViT を使って学習する単純な練習用コードです．
+Sequential Loader で動画を時系列順に流し，Q/V LoRA を付けた ViT を Streaming MoCo で
+自己教師あり学習して，ActivityNet の Linear Probe で評価する研究コード．
+CNN/ViT の教師あり分類テンプレートを土台にしており，`main.py` / `main_pl.py` による
+教師あり学習も従来どおり使える．
+
+## ディレクトリ構成
+
+| パス | 役割 |
+|---|---|
+| `main.py`, `main_pl.py`, `train.py`, `val.py`, `conf/`, `dataset/`, `setup/`, `callback/` | テンプレート由来の教師あり分類（Hydra 設定） |
+| `model/` | ネットワーク部品（`backbones/`，`aggregators/`）と分類モデルの factory |
+| `self_supervised/moco/` | MoCo の学習則（Query / Key，EMA，Queue，負例選択） |
+| `integration/` | `sequential_loader` と利用側の間の処理（時系列 stream，フレーム encode，MoCo の view） |
+| `training/` | Streaming MoCo の学習．共通 engine（`streaming_moco.py`），短時間 canary（`moco_canary.py`），本番 full run（`streaming_moco_full.py`），protocol・監査・checkpoint |
+| `evaluation/` | ラベルを使う下流評価（manifest，segment feature，Linear Probe） |
+| `scripts/` | CLI 入口（`smoke/`，`moco/`，`linear_probe/`）．ルートから `python3 -m scripts....` で実行 |
+| `utils/`, `logger/` | 共通 utility，Comet ロガー，成果物の SHA-256・provenance 記録 |
+| `test/` | pytest．本体のパッケージ構成に対応（`test/training/`，`test/self_supervised/` など） |
+
+`data/`，`hub/`，`log/`，`comet_logs/` は Git 管理外．
 
 ## 準備
 
@@ -13,7 +32,7 @@ pip install -r requirements.txt
 
 ```
 
-## 使い方
+## 使い方（教師あり分類）
 
 ```bash
 python3 main.py dataset=imagefolder dataset.root=/mnt/NAS-TVS872XT/dataset-lab/Tiny-ImageNet/ loader.num_workers=24 loader.batch_size=8 trainer.num_epochs=5 trainer.use_dp=true
@@ -118,12 +137,50 @@ VS Code の [launch.json](.vscode/launch.json) / [tasks.json](.vscode/tasks.json
 python3 -m scripts.smoke.smoke_vit_frame_encoder dog.jpg
 python3 -m scripts.smoke.smoke_activitynet_vit_clip_feature /path/to/ActivityNet
 python3 -m scripts.smoke.smoke_activitynet_vit_lora_moco_multistep /path/to/ActivityNet --max-steps 10
+python3 -m scripts.smoke.audit_activitynet_inventory /path/to/ActivityNet
 ```
 
-従来のルート直下の `smoke_*.py` は上記のモジュール実行に置き換える．
+従来のルート直下の `smoke_*.py`，`audit_activitynet_inventory.py` は上記のモジュール実行に置き換える．
 `import sequential_*_bridge` は互換入口を通して利用できる．
 データセット，チェックポイント，Git revision に関する各スクリプトの
 検証条件は従来どおり．
+
+## Full-dataset Streaming MoCo と ActivityNet Linear Probe
+
+ActivityNet v1.3 `training` 全 10,024 動画を Adapter 順に 1 回だけ処理する
+Stage 6B Streaming MoCo と，annotation segment 単位の Linear Probe の入口．
+既存の smoke / canary CLI とは別の明示的な production 入口である．
+
+```bash
+# 1. MoCo（fresh / resume を明示的に分ける）．出力は log/moco/<run_id>/
+python3 -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <run_id> --device cuda
+python3 -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <run_id> --device cuda --resume
+
+# 2. 共通 manifest（build の後，再生成 SHA-256 を照合する audit で Gate PASS）
+python3 -m scripts.linear_probe.build_manifest build /path/to/ActivityNet --manifest-id lp-v1
+python3 -m scripts.linear_probe.build_manifest audit /path/to/ActivityNet --manifest-id lp-v1
+
+# 3. segment feature（condition ごとに 1 回）
+python3 -m scripts.linear_probe.extract_features /path/to/ActivityNet --manifest-id lp-v1 --condition base_vit
+python3 -m scripts.linear_probe.extract_features /path/to/ActivityNet --manifest-id lp-v1 \
+    --condition moco_query_lora_final --snapshot log/moco/<run_id>/evaluation_snapshots/<videos-010024_..._final>
+
+# 4. Linear Probe 2 conditions x seeds 0,1,2 と集計
+python3 -m scripts.linear_probe.run_probe --manifest-id lp-v1 \
+    --base-features log/linear_probe/features/base_vit/<feature_id> \
+    --lora-features log/linear_probe/features/moco_query_lora_final/<feature_id>
+
+# Comet 登録に失敗・無効だった local artifact の再登録（hash を再検証してから）
+python3 -m scripts.retry_comet_artifact log/linear_probe/manifest/lp-v1
+```
+
+- `log/moco/<run_id>/resume/latest.pt` は 100 動画ごとの video 境界と final で atomic に更新する学習再開用 state．
+  `evaluation_snapshots/` は 1,000 動画ごとと final の Query LoRA のみ（PEFT 形式）で，下流評価専用．
+- 既存の run / manifest / feature / result は，内容が一致する場合だけ再利用し，上書きしない．
+- `--stop-after-videos`，`--max-videos-per-split`，`--smoke-epochs` は短時間 smoke 用．
+  これらの成果物は non-production として記録される．
+- 全 CLI は resolved config，Git commit / dirty 状態，artifact path，SHA-256，Comet 状態を標準出力または metadata に残す．
+  `--disable-comet` で Comet を使わずに local artifact だけを作る．
 
 ## Comet の設定
 
