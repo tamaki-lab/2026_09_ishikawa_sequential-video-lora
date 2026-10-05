@@ -16,7 +16,8 @@ from model.backbones.vit import ViTLoRAFrameEncoder
 from self_supervised.moco import ViTLoRAMoCo
 from .smoke_activitynet_vit_lora_moco_one_step import audit_provenance
 from .smoke_activitynet_vit_lora_one_step import CHECKPOINT_ID, git_output
-from training.moco_canary import run_canary, validate_sources
+from integration.sequential_stream import validate_sources
+from training.moco_canary import run_canary
 
 
 BASE_COMMIT = '1cbaa4a0fde2fd196a36feb3eeb0074709b52cd9'

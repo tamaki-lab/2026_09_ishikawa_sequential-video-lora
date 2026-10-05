@@ -18,7 +18,8 @@ from transformers import AutoImageProcessor
 
 from model.backbones.vit import ViTLoRAFrameEncoder
 from self_supervised.moco import ViTLoRAMoCo
-from training.moco_canary import run_streaming_moco, validate_sources
+from integration.sequential_stream import validate_sources
+from training.moco_canary import run_streaming_moco
 from training.moco_protocol import STAGE6A_PROTOCOL, STAGE6B_PROTOCOL
 from .smoke_activitynet_vit_lora_moco_one_step import audit_provenance
 from .smoke_activitynet_vit_lora_one_step import CHECKPOINT_ID, git_output

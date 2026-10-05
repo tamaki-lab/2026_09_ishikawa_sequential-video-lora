@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from integration.sequential_stream import STREAM_MODES, source_count
+
 
 @dataclass(frozen=True)
 class StreamingMoCoProtocol:
@@ -11,7 +13,7 @@ class StreamingMoCoProtocol:
 
     def __post_init__(self):
         for name, allowed in (
-            ('stream_mode', ('round_robin', 'strict_single')),
+            ('stream_mode', STREAM_MODES),
             ('key_transform', ('horizontal_flip', 'gbr_horizontal_flip')),
             ('negative_policy', ('different_sequence', 'all_past')),
         ):
@@ -20,7 +22,7 @@ class StreamingMoCoProtocol:
 
     @property
     def source_count(self):
-        return 4 if self.stream_mode == 'round_robin' else 1
+        return source_count(self.stream_mode)
 
     @property
     def warmup_count(self):
