@@ -1,7 +1,7 @@
 """Retry a failed or disabled Comet artifact registration for a local artifact.
 
     python -m scripts.retry_comet_artifact log/linear_probe/manifest/lp-v1
-    python -m scripts.retry_comet_artifact log/linear_probe/results/comparison
+    python -m scripts.retry_comet_artifact log/linear_probe/results/<result-id>/comparison
 
 Uses the artifact name, type, aliases and file hashes recorded under `comet` in
 the local metadata. Local SHA-256 is re-verified before upload; a mismatch stops.
@@ -27,11 +27,14 @@ def main():
     # Attach to the experiment that produced the artifact when it exists, else a new retry experiment.
     upstream = (comet.get('experiment_key') or metadata.get('moco_experiment_key')
                 or (metadata.get('comet_experiment') or {}).get('experiment_key'))
+    project_name = comet.get('project_name')
+    project_option = {} if project_name is None else {'project_name': project_name}
     experiment, status = start_experiment(f'retry__{comet["artifact_name"]}', {'retry_of': str(args.directory)},
-                                          tags=('retry',), existing_key=upstream)
+                                          tags=('retry',), existing_key=upstream, **project_option)
     result = log_artifact(experiment, args.directory, args.metadata_name, comet['artifact_name'],
                           comet['artifact_type'], comet['files'],
-                          {'retry': True, 'local_path': str(args.directory)}, aliases=comet.get('aliases', ()))
+                          {'retry': True, 'local_path': str(args.directory)}, aliases=comet.get('aliases', ()),
+                          **project_option)
     end_experiment(experiment)
     print(json.dumps({'experiment': status, 'artifact': result}), flush=True)
 

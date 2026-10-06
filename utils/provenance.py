@@ -12,18 +12,23 @@ import sequential_loader as sl
 import torch
 import transformers
 
+from utils.configuration import load_config_group, plain_config
 
-REPOSITORY = 'tamaki-lab/2026_09_ishikawa_sequential-video-lora'
-REPOSITORY_URLS = (
-    'git@github.com:tamaki-lab/2026_09_ishikawa_sequential-video-lora.git',
-    'https://github.com/tamaki-lab/2026_09_ishikawa_sequential-video-lora.git',
-)
-LOADER_BRANCH = 'ActivityNet'
-LOADER_COMMIT = '19a0ed7e4c00300214bc9a2fe12da8c72c0499c0'
-TRANSFORMERS_VERSION = '5.17.0'
-PEFT_VERSION = '0.21.0'
-CHECKPOINT_ID = 'google/vit-base-patch16-224'
-COMET_PROJECT = '2026-09-ishikawa-sequential-video-lora'
+
+_DEFAULT_POLICY = load_config_group('provenance', 'research_v1')
+_DEFAULT_ENCODER = load_config_group('encoder', 'vit_base_patch16_224')
+_DEFAULT_TRACKING = load_config_group('tracking', 'default')
+
+# Compatibility aliases for smoke scripts and old imports.  Their source of
+# truth is the Hydra group YAML, rather than a second collection of literals.
+REPOSITORY = _DEFAULT_POLICY['repository']
+REPOSITORY_URLS = tuple(_DEFAULT_POLICY['repository_urls'])
+LOADER_BRANCH = _DEFAULT_POLICY['sequential_loader']['branch']
+LOADER_COMMIT = _DEFAULT_POLICY['sequential_loader']['commit']
+TRANSFORMERS_VERSION = _DEFAULT_POLICY['dependencies']['transformers']
+PEFT_VERSION = _DEFAULT_POLICY['dependencies']['peft']
+CHECKPOINT_ID = _DEFAULT_ENCODER['checkpoint_id']
+COMET_PROJECT = _DEFAULT_TRACKING['comet_project']
 
 
 def git_output(repository, *args):
@@ -55,15 +60,20 @@ def device_identity(device):
     return {'type': 'cuda', 'selected_index': selected, 'selected': visible[selected], 'visible_devices': visible}
 
 
-def collect_provenance(*, require_clean=False):
+def collect_provenance(*, policy=None, require_clean=False):
     """Fail on an unexpected repository or pinned loader; record dirty state.
 
     Tracked changes in this repository are recorded rather than refused, so
     that development smoke runs remain possible; artifacts carry the flag.
     """
+    policy = _DEFAULT_POLICY if policy is None else plain_config(policy)
+    repository = policy['repository']
+    repository_urls = tuple(policy['repository_urls'])
+    loader_policy = policy['sequential_loader']
+    dependencies = policy['dependencies']
     root = Path(__file__).resolve().parent.parent
     origin = git_output(root, 'remote', 'get-url', 'origin')
-    if origin not in REPOSITORY_URLS:
+    if origin not in repository_urls:
         raise RuntimeError(f'Unexpected implementation repository: {origin}')
     dirty = git_output(root, 'status', '--porcelain', '--untracked-files=all')
     loader_root = Path(sl.__file__).resolve().parent.parent
@@ -72,13 +82,19 @@ def collect_provenance(*, require_clean=False):
         'commit': git_output(loader_root, 'rev-parse', 'HEAD'),
         'dirty': bool(git_output(loader_root, 'status', '--porcelain', '--untracked-files=all')),
     }
-    if (loader['branch'], loader['commit']) != (LOADER_BRANCH, LOADER_COMMIT) or loader['dirty']:
+    if (loader['branch'], loader['commit']) != (
+        loader_policy['branch'], loader_policy['commit'],
+    ) or loader['dirty']:
         raise RuntimeError(f'Unexpected or modified sequential_loader checkout: {loader}')
-    if (transformers.__version__, peft.__version__) != (TRANSFORMERS_VERSION, PEFT_VERSION):
-        raise RuntimeError(f'Requires transformers=={TRANSFORMERS_VERSION} and peft=={PEFT_VERSION}')
+    if (transformers.__version__, peft.__version__) != (
+        dependencies['transformers'], dependencies['peft'],
+    ):
+        raise RuntimeError(
+            f'Requires transformers=={dependencies["transformers"]} and peft=={dependencies["peft"]}'
+        )
     provenance = {
         'implementation': {
-            'repository': REPOSITORY,
+            'repository': repository,
             'origin': origin,
             'branch': git_output(root, 'branch', '--show-current'),
             'commit': git_output(root, 'rev-parse', 'HEAD'),

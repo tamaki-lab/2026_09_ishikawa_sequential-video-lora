@@ -12,7 +12,9 @@ from utils.artifact_io import read_json, sha256_file, write_json_atomic
 from utils.provenance import COMET_PROJECT, utc_now
 
 
-def start_experiment(name, parameters, tags=(), disabled=False, existing_key=None):
+def start_experiment(
+    name, parameters, tags=(), disabled=False, existing_key=None, project_name=COMET_PROJECT,
+):
     """Return (experiment or None, status). Never raises for network failures."""
     if disabled:
         return None, {'status': 'disabled'}
@@ -21,7 +23,7 @@ def start_experiment(name, parameters, tags=(), disabled=False, existing_key=Non
         if existing_key:
             experiment = comet_ml.ExistingExperiment(previous_experiment=existing_key)
         else:
-            experiment = comet_ml.Experiment(project_name=COMET_PROJECT)
+            experiment = comet_ml.Experiment(project_name=project_name)
             experiment.set_name(name)
             for tag in tags:
                 experiment.add_tag(tag)
@@ -71,7 +73,10 @@ def artifact_files(directory, relative_paths):
     return {path: sha256_file(directory / path) for path in relative_paths}
 
 
-def log_artifact(experiment, directory, metadata_name, name, artifact_type, files, metadata, aliases=()):
+def log_artifact(
+    experiment, directory, metadata_name, name, artifact_type, files, metadata, aliases=(),
+    project_name=COMET_PROJECT,
+):
     """Register local files as a new Comet artifact version and record status.
 
     `files` maps relative path -> expected SHA-256. Mismatches stop before any
@@ -85,7 +90,7 @@ def log_artifact(experiment, directory, metadata_name, name, artifact_type, file
         raise RuntimeError(f'Local artifact hash changed before Comet upload: {directory}')
     status = {
         'artifact_name': name, 'artifact_type': artifact_type, 'aliases': list(aliases),
-        'files': dict(files), 'time': utc_now(),
+        'project_name': project_name, 'files': dict(files), 'time': utc_now(),
     }
     if experiment is None:
         status.update(status='disabled', retry_needed=True)
