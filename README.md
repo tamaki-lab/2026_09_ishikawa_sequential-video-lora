@@ -77,7 +77,8 @@ task 用には[tasks.json](.vscode/tasks.json)に次のように設定する．
 学習設定は [conf/config.yaml](conf/config.yaml) を入口に Hydra で合成する．
 既定値は `dataset=cifar10`，`model=resnet18`，`optimizer=sgd`．
 旧 training CLI の `-d`，`-m`，`-b`，`-lr`，`--devices`，`--scratch` などは廃止した．
-単発 utility / smoke script の CLI は従来どおり．
+単発 utility / smoke script の CLI は従来どおり．Full MoCo と Linear Probe の
+実験入口は後述の専用 Hydra config を使う．
 
 | 設定 | 選択肢・例 |
 |---|---|
@@ -149,41 +150,65 @@ python3 -m scripts.smoke.audit_activitynet_inventory /path/to/ActivityNet
 
 ActivityNet v1.3 `training` 全 10,024 動画を Adapter 順に 1 回だけ処理する
 Stage 6B Streaming MoCo と，annotation segment 単位の Linear Probe の入口．
-既存の smoke / canary CLI とは別の明示的な production 入口である．
+既存の smoke / canary CLI とは別の明示的な production 入口である．設定の入口は
+`conf/moco_full.yaml`，`conf/linear_probe_{manifest,features,run}.yaml`．共通の科学設定は
+`activitynet`，`encoder`，`sequential`，`moco`，`linear_probe`，`provenance` の
+config group、Comet名などの運用設定は `tracking` group に分離している．
 
 ```bash
 # 1. MoCo（fresh / resume を明示的に分ける）．出力は log/moco/<run_id>/
-python3 -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <run_id> --seed <seed> --device cuda
-python3 -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <run_id> --seed <same-seed> --device cuda --resume
+python3 -m scripts.moco.train_full_streaming_moco \
+    runtime.dataset_root=/path/to/ActivityNet runtime.run_id=<run_id> runtime.seed=<seed> runtime.device=cuda
+python3 -m scripts.moco.train_full_streaming_moco \
+    runtime.dataset_root=/path/to/ActivityNet runtime.run_id=<run_id> runtime.seed=<same-seed> \
+    runtime.device=cuda runtime.resume=true
 
 # 2. 共通 manifest（build の後，再生成 SHA-256 を照合する audit で Gate PASS）
-python3 -m scripts.linear_probe.build_manifest build /path/to/ActivityNet --manifest-id lp-v1
-python3 -m scripts.linear_probe.build_manifest audit /path/to/ActivityNet --manifest-id lp-v1
+python3 -m scripts.linear_probe.build_manifest \
+    runtime.command=build runtime.dataset_root=/path/to/ActivityNet runtime.manifest_id=lp-v1
+python3 -m scripts.linear_probe.build_manifest \
+    runtime.command=audit runtime.dataset_root=/path/to/ActivityNet runtime.manifest_id=lp-v1
 
 # 3. segment feature（condition ごとに 1 回）
-python3 -m scripts.linear_probe.extract_features /path/to/ActivityNet --manifest-id lp-v1 --condition base_vit
-python3 -m scripts.linear_probe.extract_features /path/to/ActivityNet --manifest-id lp-v1 \
-    --condition moco_query_lora_final --snapshot log/moco/<run_id>/evaluation_snapshots/<videos-010024_..._final>
+python3 -m scripts.linear_probe.extract_features \
+    runtime.dataset_root=/path/to/ActivityNet runtime.manifest_id=lp-v1 runtime.condition=base_vit
+python3 -m scripts.linear_probe.extract_features \
+    runtime.dataset_root=/path/to/ActivityNet runtime.manifest_id=lp-v1 \
+    runtime.condition=moco_query_lora_final \
+    runtime.snapshot=log/moco/<run_id>/evaluation_snapshots/<videos-010024_..._final>
 
 # 4. Linear Probe 2 conditions x seeds 0,1,2 と集計
-python3 -m scripts.linear_probe.run_probe --manifest-id lp-v1 \
-    --base-features log/linear_probe/features/base_vit/<feature_id> \
-    --lora-features log/linear_probe/features/moco_query_lora_final/<feature_id>
+python3 -m scripts.linear_probe.run_probe runtime.manifest_id=lp-v1 \
+    runtime.base_features=log/linear_probe/features/base_vit/<feature_id> \
+    runtime.lora_features=log/linear_probe/features/moco_query_lora_final/<feature_id>
+
+# 短時間確認（科学設定のoverrideなので自動的にnon-production）
+python3 -m scripts.linear_probe.run_probe linear_probe.probe.epochs=1 \
+    runtime.manifest_id=lp-v1 runtime.base_features=<base_feature_dir> runtime.lora_features=<lora_feature_dir>
+
+# 実行せずに合成済み設定を確認
+python3 -m scripts.moco.train_full_streaming_moco --cfg job --resolve
+python3 -m scripts.linear_probe.run_probe --cfg job --resolve
 
 # Comet 登録に失敗・無効だった local artifact の再登録（hash を再検証してから）
 python3 -m scripts.retry_comet_artifact log/linear_probe/manifest/lp-v1
-python3 -m scripts.retry_comet_artifact log/linear_probe/results/comparison
+python3 -m scripts.retry_comet_artifact log/linear_probe/results/<result_id>/comparison
 ```
 
 - `log/moco/<run_id>/resume/latest.pt` は 100 動画ごとの video 境界と final で atomic に更新する学習再開用 state．
   `evaluation_snapshots/` は 1,000 動画ごとと final の Query LoRA のみ（PEFT 形式）で，下流評価専用．
-- Full MoCo の `--seed` は fresh / resume の両方で明示必須で，同じ値を使う．production CLI は
+- Full MoCo の `runtime.seed` は fresh / resume の両方で明示必須で，同じ値を使う．canonical production は
   untracked file を含む clean checkout だけを受理し，code・seed・device identity の不一致を resume 時に拒否する．
 - 既存の run / manifest / feature / result は，内容が一致する場合だけ再利用し，上書きしない．
-- `--stop-after-videos`，`--max-videos-per-split`，`--smoke-epochs` は短時間 smoke 用．
-  これらの成果物は non-production として記録される．
+- `runtime.stop_after_videos`，`runtime.max_videos_per_split`，`linear_probe.probe.epochs` の
+  override は短時間 smoke に使える．canonical preset と異なる科学設定の成果物は non-production として記録される．
+  実装されていない値（`linear_probe.feature_definition` の変更，scheduler，class weight など）は，
+  記録だけが変わるのを防ぐため実行前に拒否する．
+- Feature ID と Probe result ID は内容の SHA-256 から自動生成する．任意IDを使う場合だけ
+  `runtime.feature_id` / `runtime.result_id` を指定する．データセットやartifactのローカルパスは
+  `locations` として記録するが，内容同一性のhashには含めない．
 - 全 CLI は resolved config，Git commit / dirty 状態，artifact path，SHA-256，Comet 状態を標準出力または metadata に残す．
-  `--disable-comet` で Comet を使わずに local artifact だけを作る．
+  `logging.disable_comet=true` で Comet を使わずに local artifact だけを作る．
 
 ## Comet の設定
 
