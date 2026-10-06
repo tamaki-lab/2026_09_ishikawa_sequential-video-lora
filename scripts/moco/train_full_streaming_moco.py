@@ -20,7 +20,7 @@ import sequential_loader as sl
 import torch
 from transformers import AutoImageProcessor
 
-from logger.comet_lineage import end_experiment, start_experiment
+from logger.comet_lineage import display_tag, end_experiment, scope_tag, start_experiment
 from model.backbones.vit import ViTLoRAFrameEncoder
 from self_supervised.moco import ViTLoRAMoCo
 from training.moco_checkpoint import seed_all
@@ -82,9 +82,13 @@ def run(cfg):
     existing_key = None
     if runtime.resume:
         existing_key = read_json(run_dir / 'run_metadata.json').get('moco_experiment_key')
+    # Tracking scope only: an explicit stop makes a canonical-config run a smoke run.
+    production_run = production_config and runtime.stop_after_videos is None
+    protocol_tag = display_tag(settings.moco.name)
     experiment, comet = start_experiment(
-        f'moco-full__{runtime.run_id}', {'config': run_config, 'provenance': provenance},
-        tags=('moco', 'full-dataset'), disabled=settings.disable_comet, existing_key=existing_key,
+        f'{protocol_tag}__moco__{runtime.run_id}', {'config': run_config, 'provenance': provenance},
+        tags=('moco', scope_tag(production_run), protocol_tag, f'seed-{runtime.seed}'),
+        disabled=settings.disable_comet, existing_key=existing_key,
         project_name=settings.tracking['comet_project'],
     )
     print(f'Comet: {json.dumps(comet)}', flush=True)

@@ -12,6 +12,18 @@ from utils.artifact_io import read_json, sha256_file, write_json_atomic
 from utils.provenance import COMET_PROJECT, utc_now
 
 
+def scope_tag(production):
+    """Comet scope tag; only an explicit bool decides production vs smoke."""
+    if type(production) is not bool:
+        raise TypeError(f'production must be bool, got {type(production).__name__}')
+    return 'production' if production else 'smoke'
+
+
+def display_tag(value):
+    """Comet display token for a config / condition value; the value itself is unchanged."""
+    return value.replace('_', '-')
+
+
 def start_experiment(
     name, parameters, tags=(), disabled=False, existing_key=None, project_name=COMET_PROJECT,
 ):

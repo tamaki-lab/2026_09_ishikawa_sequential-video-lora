@@ -73,6 +73,27 @@ def test_resume_is_explicit_and_reads_saved_experiment(cli):
     assert 'resumes' in json.loads((cli['root'] / 'run1' / 'run_metadata.json').read_text())
 
 
+@pytest.mark.parametrize('overrides, scope', [
+    ((), 'production'), (('runtime.stop_after_videos=2',), 'smoke'), (('moco.optimizer.lr=0.002',), 'smoke'),
+])
+def test_fresh_run_comet_experiment_labels(cli, monkeypatch, overrides, scope):
+    start = Mock(return_value=(None, {'status': 'disabled'}))
+    monkeypatch.setattr(cli_module, 'start_experiment', start)
+    cli['invoke']('runtime.run_id=run1', *overrides)
+    assert start.call_args.args[0] == 'stage6b-v2__moco__run1'
+    assert start.call_args.kwargs['tags'] == ('moco', scope, 'stage6b-v2', 'seed-7')
+    assert start.call_args.kwargs['existing_key'] is None
+
+
+def test_resume_reconnects_saved_comet_experiment(cli, monkeypatch):
+    start = Mock(return_value=(None, {'status': 'disabled'}))
+    monkeypatch.setattr(cli_module, 'start_experiment', start)
+    (cli['root'] / 'run1').mkdir()
+    (cli['root'] / 'run1' / 'run_metadata.json').write_text(json.dumps({'moco_experiment_key': 'saved-key'}))
+    cli['invoke']('runtime.run_id=run1', 'runtime.resume=true')
+    assert start.call_args.kwargs['existing_key'] == 'saved-key'
+
+
 def test_scientific_override_is_explicitly_nonproduction(cli):
     cli['invoke']('runtime.run_id=custom', 'moco.optimizer.lr=0.002')
     assert cli['provenance'].call_args.kwargs['require_clean'] is False

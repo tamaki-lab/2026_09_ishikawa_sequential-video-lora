@@ -20,7 +20,7 @@ from transformers import AutoImageProcessor
 
 from evaluation import activitynet_manifest as manifest
 from evaluation import segment_features as features
-from logger.comet_lineage import end_experiment, log_artifact, start_experiment
+from logger.comet_lineage import display_tag, end_experiment, log_artifact, scope_tag, start_experiment
 from model.backbones.vit import ViTFrameEncoder, ViTLoRAFrameEncoder
 from training.moco_checkpoint import (
     encoder_base_fingerprint, load_query_lora_snapshot, validate_production_snapshot_metadata,
@@ -226,10 +226,12 @@ def run(cfg):
 
     # Extraction never trains: both encoders are fully frozen and in eval mode.
     encoder = encoder.to(device).eval().requires_grad_(False)
+    protocol = resolved['linear_probe']['id']
+    condition_tag = display_tag(runtime['condition'])
     experiment, comet = start_experiment(
-        f'{resolved["linear_probe"]["id"]}__features__{runtime["condition"].replace("_", "-")}',
-        inputs, tags=('linear-probe', 'features'), disabled=logging['disable_comet'],
-        project_name=resolved['tracking']['comet_project'])
+        f'{protocol}__features__{condition_tag}', inputs,
+        tags=('linear-probe', 'features', condition_tag, scope_tag(production), display_tag(protocol)),
+        disabled=logging['disable_comet'], project_name=resolved['tracking']['comet_project'])
     splits = {}
     for split in manifest.SPLITS:
         split_rows = [row for row in rows if row['split'] == split]

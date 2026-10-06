@@ -93,8 +93,9 @@ def test_mean_and_sample_std_and_aggregate():
     assert result['moco_query_lora_final']['top1_std'] == 0.
     rows = list(csv.DictReader(io.StringIO(probe.aggregate_csv(result).decode())))
     assert [row['seed'] for row in rows[:5]] == ['0', '1', '2', 'mean', 'sample_std_ddof1']
-    assert probe.experiment_name('moco_query_lora_final', 2) == 'lp-v1__moco-query-lora-final__seed-2'
-    assert probe.experiment_name('base_vit', 0) == 'lp-v1__base-vit__seed-0'
+    assert probe.experiment_name('lp-v1', 'base_vit', 0) == 'lp-v1__probe__base-vit__seed-0'
+    assert probe.experiment_name('lp-v1', 'moco_query_lora_final', 2) == 'lp-v1__probe__moco-query-lora-final__seed-2'
+    assert probe.experiment_name('moco_query_lora_final', 2) == 'lp-v1__probe__moco-query-lora-final__seed-2'
 
 
 def test_result_files_round_trip_and_tamper_detection(tmp_path):

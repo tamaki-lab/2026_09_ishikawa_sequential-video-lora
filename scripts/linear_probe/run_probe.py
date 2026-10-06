@@ -20,7 +20,7 @@ import torch
 from evaluation import linear_probe as probe
 from evaluation import activitynet_manifest as manifest
 from evaluation import segment_features as features
-from logger.comet_lineage import end_experiment, log_artifact, log_metrics, start_experiment
+from logger.comet_lineage import display_tag, end_experiment, log_artifact, log_metrics, scope_tag, start_experiment
 from scripts.linear_probe.configuration import feature_science_contract, science_contract
 from training.moco_checkpoint import validate_production_snapshot_metadata
 from utils.artifact_io import canonical_json_bytes, read_json, sha256_bytes, sha256_file
@@ -72,8 +72,9 @@ def run_seed(
         return summary
     name = probe.experiment_name(config.protocol, condition, seed)
     experiment, comet = start_experiment(
-        name, inputs, tags=('linear-probe', condition), disabled=runtime['disable_comet'],
-        project_name=project_name,
+        name, inputs, tags=('linear-probe', 'probe', display_tag(condition), f'seed-{seed}', scope_tag(production),
+                            display_tag(config.protocol)),
+        disabled=runtime['disable_comet'], project_name=project_name,
     )
     train, validation = splits['training'], splits['validation']
     before = (train['features'].clone(), validation['features'].clone())
@@ -265,8 +266,8 @@ def run(cfg):
     ))
     experiment, comet = start_experiment(f'{probe_config.protocol}__aggregate', {
         key: aggregate[key] for key in ('production', 'segment_manifest_sha256', 'probe_experiment_keys', 'inputs')
-    }, tags=('linear-probe', 'aggregate'), disabled=runtime['disable_comet'],
-        project_name=resolved['tracking']['comet_project'])
+    }, tags=('linear-probe', 'aggregate', scope_tag(production), display_tag(probe_config.protocol)),
+        disabled=runtime['disable_comet'], project_name=resolved['tracking']['comet_project'])
     for condition, values in result.items():
         log_metrics(experiment, {f'{condition}/top1_mean': values['top1_mean'],
                                  f'{condition}/macro_class_accuracy_mean': values['macro_class_accuracy_mean']})

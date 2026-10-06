@@ -19,7 +19,7 @@ from omegaconf import DictConfig, OmegaConf
 import sequential_loader as sl
 
 from evaluation import activitynet_manifest as manifest
-from logger.comet_lineage import end_experiment, log_artifact, start_experiment
+from logger.comet_lineage import display_tag, end_experiment, log_artifact, scope_tag, start_experiment
 from scripts.linear_probe.configuration import science_contract
 from utils.artifact_io import canonical_json_bytes, sha256_bytes, sha256_file, write_json_atomic
 from utils.configuration import load_config_group, plain_config, validate_path_component
@@ -142,12 +142,12 @@ def audit(runtime, activitynet, sequential, science, directory, progress_interva
     if status not in ('PASS', 'SMOKE_PASS'):
         return False
     experiment, comet = start_experiment(
-        f'{runtime["manifest_id"]}__manifest', {
+        f'{runtime["protocol"]}__manifest__{runtime["manifest_id"]}', {
             'manifest_id': runtime['manifest_id'], 'production': metadata['production'],
             'segment_manifest_sha256': metadata['segment_manifest_sha256'],
             'label_mapping_sha256': metadata['label_mapping_sha256']},
-        tags=('linear-probe', 'manifest'), disabled=runtime['disable_comet'],
-        project_name=runtime['tracking']['comet_project'])
+        tags=('linear-probe', 'manifest', scope_tag(metadata['production']), display_tag(runtime['protocol'])),
+        disabled=runtime['disable_comet'], project_name=runtime['tracking']['comet_project'])
     files = {name: sha256_file(directory / name) for name in (manifest.MANIFEST_FILE, manifest.MAPPING_FILE)}
     artifact_name = runtime['tracking']['artifacts']['linear_probe_manifest']
     status = log_artifact(experiment, directory, 'metadata.json', artifact_name, 'dataset', files, {
@@ -179,6 +179,7 @@ def run(cfg):
     runtime = {
         **runtime, 'disable_comet': logging['disable_comet'],
         'provenance_policy': resolved['provenance'], 'tracking': resolved['tracking'],
+        'protocol': resolved['linear_probe']['id'],
     }
     directory = Path(runtime['output_root']) / 'manifest' / runtime['manifest_id']
     print('Resolved config:\n' + OmegaConf.to_yaml(cfg, resolve=True), flush=True)

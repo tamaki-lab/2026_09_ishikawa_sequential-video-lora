@@ -73,3 +73,18 @@ def test_experiment_start_failure_returns_status(monkeypatch):
 
 def test_nested_parameters_are_flattened():
     assert lineage._flatten({'a': {'b': 1, 'c': [1]}, 'd': None}) == {'a.b': 1, 'a.c': '[1]', 'd': None}
+
+
+def test_scope_tag_requires_bool():
+    assert lineage.scope_tag(True) == 'production'
+    assert lineage.scope_tag(False) == 'smoke'
+    for value in (1, 0, None, 'production'):
+        with pytest.raises(TypeError):
+            lineage.scope_tag(value)
+
+
+@pytest.mark.parametrize('value, tag', [
+    ('stage6b_v2', 'stage6b-v2'), ('moco_query_lora_final', 'moco-query-lora-final'), ('lp-v1', 'lp-v1'),
+])
+def test_display_tag_hyphenates(value, tag):
+    assert lineage.display_tag(value) == tag

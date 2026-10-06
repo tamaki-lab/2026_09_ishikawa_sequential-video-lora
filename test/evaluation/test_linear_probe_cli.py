@@ -145,3 +145,51 @@ def test_feature_definition_override_is_rejected_before_extraction(cli):
                'runtime.condition=base_vit', 'runtime.device=cpu',
                'linear_probe.feature_definition.normalization=l2')
     assert not (root / 'features').exists()
+
+
+@pytest.fixture
+def comet_calls(monkeypatch):
+    """Record each new Comet experiment's (name, tags); Comet itself stays disabled."""
+    calls = []
+    for module in (build_manifest, extract_features, run_probe):
+        def record(name, parameters, tags=(), start=module.start_experiment, **kwargs):
+            calls.append((name, tags))
+            return start(name, parameters, tags=tags, **kwargs)
+        monkeypatch.setattr(module, 'start_experiment', record)
+    return calls
+
+
+@pytest.mark.parametrize('scope', ['smoke', 'production'])
+def test_pipeline_comet_experiment_labels(cli, comet_calls, monkeypatch, scope):
+    root, invoke = cli
+    if scope == 'production':
+        # Treat the synthetic config as canonical so every stage takes its production path.
+        for module, name in ((build_manifest, 'science_contract'), (extract_features, 'feature_science_contract'),
+                             (run_probe, 'science_contract'), (run_probe, 'feature_science_contract')):
+            contract = getattr(module, name)
+            monkeypatch.setattr(module, name, lambda *args, contract=contract: {**contract(*args), 'canonical': True})
+        monkeypatch.setattr(run_probe, 'validate_production_snapshot_metadata', lambda *args, **kwargs: None)
+    manifest_args = ('runtime.dataset_root=/anet', 'runtime.manifest_id=m')
+    invoke(build_manifest, 'runtime.command=build', *manifest_args)
+    invoke(build_manifest, 'runtime.command=audit', *manifest_args)
+    for condition, snapshot in (('base_vit', ()), ('moco_query_lora_final', (f'runtime.snapshot={root / "snap"}',))):
+        invoke(extract_features, *manifest_args, f'runtime.condition={condition}', 'runtime.device=cpu',
+               f'runtime.feature_id={condition}', *snapshot)
+    invoke(run_probe, 'runtime.manifest_id=m', f'runtime.base_features={root / "features/base_vit/base_vit"}',
+           f'runtime.lora_features={root / "features/moco_query_lora_final/moco_query_lora_final"}',
+           'runtime.result_id=r', 'linear_probe.probe.epochs=1')
+
+    probes = [(f'lp-v1__probe__{condition}__seed-{seed}',
+               ('linear-probe', 'probe', condition, f'seed-{seed}', scope, 'lp-v1'))
+              for condition in ('base-vit', 'moco-query-lora-final') for seed in (0, 1, 2)]
+    assert comet_calls == [
+        ('lp-v1__manifest__m', ('linear-probe', 'manifest', scope, 'lp-v1')),
+        ('lp-v1__features__base-vit', ('linear-probe', 'features', 'base-vit', scope, 'lp-v1')),
+        ('lp-v1__features__moco-query-lora-final',
+         ('linear-probe', 'features', 'moco-query-lora-final', scope, 'lp-v1')),
+        *probes,
+        ('lp-v1__aggregate', ('linear-probe', 'aggregate', scope, 'lp-v1')),
+    ]
+    aggregate = json.loads((root / 'results' / 'r' / 'comparison' / 'aggregate_summary.json').read_text())
+    assert aggregate['production'] is (scope == 'production')
+    assert set(aggregate['probe_experiment_keys']) == {name for name, _ in probes}

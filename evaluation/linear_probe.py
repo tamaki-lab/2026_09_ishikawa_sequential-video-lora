@@ -17,6 +17,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from logger.comet_lineage import display_tag
 from utils.artifact_io import read_json, sha256_file, write_bytes_atomic, write_json_atomic
 from utils.configuration import load_config_group
 
@@ -137,7 +138,7 @@ def experiment_name(protocol, condition=None, seed=None):
     if seed is None:
         # Legacy two-argument form: experiment_name(condition, seed).
         protocol, condition, seed = PROTOCOL, protocol, condition
-    return f'{protocol}__{condition.replace("_", "-")}__seed-{seed}'
+    return f'{protocol}__probe__{display_tag(condition)}__seed-{seed}'
 
 
 def train_probe(features, labels, seed, config=None, class_count=None, *, on_epoch=None):
