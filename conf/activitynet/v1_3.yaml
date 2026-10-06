@@ -1,0 +1,10 @@
+name: ActivityNet
+version: "1.3"
+annotation_version: "VERSION 1.3"
+splits:
+  training: training
+  validation: validation
+expected_source_counts:
+  training: 10024
+  validation: 4926
+class_count: 200

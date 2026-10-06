@@ -1,0 +1,2 @@
+frames_per_chunk: 16
+round_robin_stream_count: 4

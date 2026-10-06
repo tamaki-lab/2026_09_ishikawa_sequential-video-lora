@@ -1,0 +1,10 @@
+repository: tamaki-lab/2026_09_ishikawa_sequential-video-lora
+repository_urls:
+  - git@github.com:tamaki-lab/2026_09_ishikawa_sequential-video-lora.git
+  - https://github.com/tamaki-lab/2026_09_ishikawa_sequential-video-lora.git
+sequential_loader:
+  branch: ActivityNet
+  commit: 19a0ed7e4c00300214bc9a2fe12da8c72c0499c0
+dependencies:
+  transformers: 5.17.0
+  peft: 0.21.0

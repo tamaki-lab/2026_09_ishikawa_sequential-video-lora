@@ -1,0 +1,12 @@
+checkpoint_id: google/vit-base-patch16-224
+feature_size: 768
+image_size: 224
+channels: 3
+lora:
+  target_modules:
+    - q_proj
+    - v_proj
+  r: 8
+  lora_alpha: 8
+  lora_dropout: 0.0
+  bias: none

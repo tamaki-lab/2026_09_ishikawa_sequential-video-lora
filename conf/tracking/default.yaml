@@ -1,0 +1,9 @@
+comet_project: 2026-09-ishikawa-sequential-video-lora
+
+artifacts:
+  moco_snapshot: activitynet-moco-query-lora
+  linear_probe_manifest: activitynet-linear-probe-manifest
+  linear_probe_features:
+    base_vit: activitynet-segment-features-base-vit
+    moco_query_lora_final: activitynet-segment-features-moco-query-lora
+  linear_probe_results: activitynet-linear-probe-results
