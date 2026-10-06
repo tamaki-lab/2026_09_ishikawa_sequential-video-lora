@@ -153,8 +153,8 @@ Stage 6B Streaming MoCo と，annotation segment 単位の Linear Probe の入�
 
 ```bash
 # 1. MoCo（fresh / resume を明示的に分ける）．出力は log/moco/<run_id>/
-python3 -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <run_id> --device cuda
-python3 -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <run_id> --device cuda --resume
+python3 -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <run_id> --seed <seed> --device cuda
+python3 -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <run_id> --seed <same-seed> --device cuda --resume
 
 # 2. 共通 manifest（build の後，再生成 SHA-256 を照合する audit で Gate PASS）
 python3 -m scripts.linear_probe.build_manifest build /path/to/ActivityNet --manifest-id lp-v1
@@ -172,10 +172,13 @@ python3 -m scripts.linear_probe.run_probe --manifest-id lp-v1 \
 
 # Comet 登録に失敗・無効だった local artifact の再登録（hash を再検証してから）
 python3 -m scripts.retry_comet_artifact log/linear_probe/manifest/lp-v1
+python3 -m scripts.retry_comet_artifact log/linear_probe/results/comparison
 ```
 
 - `log/moco/<run_id>/resume/latest.pt` は 100 動画ごとの video 境界と final で atomic に更新する学習再開用 state．
   `evaluation_snapshots/` は 1,000 動画ごとと final の Query LoRA のみ（PEFT 形式）で，下流評価専用．
+- Full MoCo の `--seed` は fresh / resume の両方で明示必須で，同じ値を使う．production CLI は
+  untracked file を含む clean checkout だけを受理し，code・seed・device identity の不一致を resume 時に拒否する．
 - 既存の run / manifest / feature / result は，内容が一致する場合だけ再利用し，上書きしない．
 - `--stop-after-videos`，`--max-videos-per-split`，`--smoke-epochs` は短時間 smoke 用．
   これらの成果物は non-production として記録される．
