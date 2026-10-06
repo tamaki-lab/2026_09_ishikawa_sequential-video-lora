@@ -14,13 +14,16 @@ from transformers import AutoImageProcessor
 
 from model.backbones.vit import ViTFrameEncoder
 from integration.sequential_vit import encode_chunk
+from utils.configuration import load_config_group
 
 
-CHECKPOINT_ID = "google/vit-base-patch16-224"
+ENCODER_CONFIG = load_config_group('encoder', 'vit_base_patch16_224')
+SEQUENTIAL_CONFIG = load_config_group('sequential', 'default')
+CHECKPOINT_ID = ENCODER_CONFIG['checkpoint_id']
 EXPECTED_BRANCH = "feature-50salads-loder"
 BASE_COMMIT = "e7e037a9191f36b26e87f80f48caccfb35b6166d"
 LOADER_COMMIT = "cef09aa12560127451a5f569d86d5d51671e6986"
-FRAMES_PER_CHUNK = 16
+FRAMES_PER_CHUNK = SEQUENTIAL_CONFIG['frames_per_chunk']
 
 
 def git_output(repository: Path, *args: str) -> str:

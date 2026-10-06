@@ -15,14 +15,18 @@ from transformers import AutoImageProcessor
 from model.aggregators import MaskedMeanClipAggregator
 from model.backbones.vit import ViTFrameEncoder
 from integration.sequential_vit import encode_chunk
+from utils.configuration import load_config_group
 
 
-CHECKPOINT_ID = "google/vit-base-patch16-224"
+ENCODER_CONFIG = load_config_group('encoder', 'vit_base_patch16_224')
+SEQUENTIAL_CONFIG = load_config_group('sequential', 'default')
+PROVENANCE_CONFIG = load_config_group('provenance', 'research_v1')
+CHECKPOINT_ID = ENCODER_CONFIG['checkpoint_id']
 EXPECTED_BRANCH = "dev"
 BASE_COMMIT = "3c0e40e86924ceb38931c2d5214ecf3251a8f99d"
-LOADER_COMMIT = "19a0ed7e4c00300214bc9a2fe12da8c72c0499c0"
-FRAMES_PER_CHUNK = 16
-FEATURE_SIZE = 768
+LOADER_COMMIT = PROVENANCE_CONFIG['sequential_loader']['commit']
+FRAMES_PER_CHUNK = SEQUENTIAL_CONFIG['frames_per_chunk']
+FEATURE_SIZE = ENCODER_CONFIG['feature_size']
 
 
 def git_output(repository: Path, *args: str) -> str:

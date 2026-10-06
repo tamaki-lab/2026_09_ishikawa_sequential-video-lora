@@ -21,8 +21,8 @@ from self_supervised.moco.vit_lora_moco import require_normalized
 from integration.sequential_moco import make_two_views, encode_query_view, encode_key_view
 from training.moco_audit import audit_initial_state, audit_parameters, audit_views, parameter_groups
 from .smoke_activitynet_vit_lora_one_step import (
-    CHECKPOINT_ID, EXPECTED_BRANCH, LOADER_BRANCH, LOADER_COMMIT,
-    FRAMES_PER_CHUNK, git_output,
+    CHECKPOINT_ID, ENCODER_CONFIG, EXPECTED_BRANCH, LOADER_BRANCH, LOADER_COMMIT,
+    FRAMES_PER_CHUNK, MOCO_CONFIG, PROVENANCE_CONFIG, git_output,
 )
 
 
@@ -34,10 +34,7 @@ def audit_provenance():
     branch = git_output(root, 'branch', '--show-current')
     revision = git_output(root, 'rev-parse', 'HEAD')
     origin = git_output(root, 'remote', 'get-url', 'origin')
-    if origin not in (
-        'git@github.com:tamaki-lab/2026_09_ishikawa_sequential-video-lora.git',
-        'https://github.com/tamaki-lab/2026_09_ishikawa_sequential-video-lora.git',
-    ):
+    if origin not in PROVENANCE_CONFIG['repository_urls']:
         raise RuntimeError(f'Unexpected implementation repository: {origin}')
     if branch != EXPECTED_BRANCH:
         raise RuntimeError(f'Expected implementation branch {EXPECTED_BRANCH}, got {branch}')
@@ -49,8 +46,11 @@ def audit_provenance():
         raise RuntimeError('Unexpected sequential_loader branch or revision')
     if git_output(loader_root, 'status', '--porcelain', '--untracked-files=no'):
         raise RuntimeError('Pinned sequential_loader checkout has tracked changes')
-    if transformers.__version__ != '5.17.0' or peft.__version__ != '0.21.0':
-        raise RuntimeError('Stage 5 requires transformers==5.17.0 and peft==0.21.0')
+    dependencies = PROVENANCE_CONFIG['dependencies']
+    if transformers.__version__ != dependencies['transformers'] or peft.__version__ != dependencies['peft']:
+        raise RuntimeError(
+            f"Stage 5 requires transformers=={dependencies['transformers']} and peft=={dependencies['peft']}"
+        )
     print(f'implementation origin: {origin}')
     print(f'implementation branch / HEAD: {branch} / {revision}')
     print(f'implementation base: {BASE_COMMIT}')
@@ -71,12 +71,14 @@ def read_first_chunk(source):
         raise RuntimeError('Expected SequentialSample')
     if (sample.sequence_id, sample.sequence_index, sample.is_first) != (source.sequence_id, 0, True):
         raise RuntimeError('Expected the first chunk of the selected source')
-    if sample.frames.ndim != 4 or tuple(sample.frames.shape[:2]) != (16, 3):
-        raise RuntimeError('Expected 16 RGB frames including padding')
+    if sample.frames.ndim != 4 or tuple(sample.frames.shape[:2]) != (
+        FRAMES_PER_CHUNK, ENCODER_CONFIG['channels'],
+    ):
+        raise RuntimeError(f'Expected {FRAMES_PER_CHUNK} RGB frames including padding')
     if sample.frames.device.type != 'cpu' or sample.frames.dtype != torch.uint8:
         raise RuntimeError('Expected CPU uint8 frames')
-    if sample.valid_mask.shape != (16,) or sample.valid_mask.dtype != torch.bool:
-        raise RuntimeError('Expected bool valid_mask [16]')
+    if sample.valid_mask.shape != (FRAMES_PER_CHUNK,) or sample.valid_mask.dtype != torch.bool:
+        raise RuntimeError(f'Expected bool valid_mask [{FRAMES_PER_CHUNK}]')
     count = int(sample.valid_mask.sum().item())
     if not count or not torch.equal(sample.frame_indices[sample.valid_mask], torch.arange(count)):
         raise RuntimeError('Expected valid contiguous frame indices starting at zero')
@@ -87,14 +89,19 @@ def report_sample(label, sample):
     print(f'{label} sequence_id / sequence_index: {sample.sequence_id} / {sample.sequence_index}')
     print(f'{label} frame_indices: {sample.frame_indices.tolist()}')
     print(f'{label} timestamps: {sample.timestamps.tolist()}')
-    print(f'{label} valid count / T: {int(sample.valid_mask.sum())}/16')
+    print(f'{label} valid count / T: {int(sample.valid_mask.sum())}/{FRAMES_PER_CHUNK}')
 
 
 def report_features(label, result, sample):
     pixels, frames, clip, projected = result
     for name, value, shape in (
-        ('pixel_values', pixels, (int(sample.valid_mask.sum()), 3, 224, 224)),
-        ('frame_features', frames, (16, 768)), ('clip_feature', clip, (768,)), ('projected', projected, (128,)),
+        ('pixel_values', pixels, (
+            int(sample.valid_mask.sum()), ENCODER_CONFIG['channels'], ENCODER_CONFIG['image_size'],
+            ENCODER_CONFIG['image_size'],
+        )),
+        ('frame_features', frames, (FRAMES_PER_CHUNK, ENCODER_CONFIG['feature_size'])),
+        ('clip_feature', clip, (ENCODER_CONFIG['feature_size'],)),
+        ('projected', projected, (MOCO_CONFIG['projection_size'],)),
     ):
         print(f'{label} {name} shape: {tuple(value.shape)}')
         if tuple(value.shape) != shape or not torch.isfinite(value).all().item():
@@ -107,7 +114,10 @@ def report_features(label, result, sample):
 def run_one_step(moco, query, key, sample):
     groups = audit_parameters(moco)
     expected = {**groups['query LoRA'], **groups['query Projector']}
-    optimizer = torch.optim.AdamW(moco.query_parameters(), lr=1.0e-3, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(
+        moco.query_parameters(), lr=MOCO_CONFIG['optimizer']['lr'],
+        weight_decay=MOCO_CONFIG['optimizer']['weight_decay'],
+    )
     optimized = [p for group in optimizer.param_groups for p in group['params']]
     expected_ids = {id(p) for p in expected.values()}
     unexpected = [name for name, p in moco.named_parameters()
@@ -156,7 +166,7 @@ def run_one_step(moco, query, key, sample):
             query_p = groups[f'query {kind}'][name.replace('key_', 'query_', 1)]
             expected_value = before[name] * moco.momentum + query_p.detach().cpu() * (1. - moco.momentum)
             if not torch.allclose(p.detach().cpu(), expected_value, rtol=1e-6, atol=1e-8):
-                raise RuntimeError('Key EMA does not match m=0.999 formula')
+                raise RuntimeError(f'Key EMA does not match m={moco.momentum} formula')
     for label, parameters in groups.items():
         changed = sum(not torch.equal(before[name], p.detach().cpu()) for name, p in parameters.items())
         print(f'{label} changed count: {changed}')

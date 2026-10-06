@@ -53,7 +53,10 @@ def main():
     device = torch.device(args.device)
     print(f'device: {device}; training target: {args.max_steps}; fresh state: True')
     sources = sl.ActivityNetAdapter(dataset_root=args.dataset_root).sequence_sources('training')[:protocol.source_count]
-    validate_sources(sources, stream_mode=protocol.stream_mode)
+    validate_sources(
+        sources, stream_mode=protocol.stream_mode,
+        round_robin_stream_count=protocol.round_robin_stream_count,
+    )
     print(f'ActivityNet training first {protocol.source_count} sources: {[source.sequence_id for source in sources]}')
     processor = AutoImageProcessor.from_pretrained(CHECKPOINT_ID)
     moco = ViTLoRAMoCo(ViTLoRAFrameEncoder(CHECKPOINT_ID)).to(device).train()

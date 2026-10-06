@@ -13,9 +13,11 @@ import av
 import sequential_loader as sl
 import torch
 from PIL import Image
+from utils.configuration import load_config_group
 
 
-FRAMES_PER_CHUNK = 16
+ACTIVITYNET_CONFIG = load_config_group('activitynet', 'v1_3')
+FRAMES_PER_CHUNK = load_config_group('sequential', 'default')['frames_per_chunk']
 
 
 @dataclass
@@ -68,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/tmp/activitynet_timestamp_audit"),
+        default=Path("log/audits/activitynet_timestamp_alignment"),
     )
     parser.add_argument(
         "--origin-tolerance",
@@ -89,7 +91,7 @@ def load_activitynet_database(annotation_path: Path) -> dict[str, Any]:
     with annotation_path.open(encoding="utf-8") as f:
         data = json.load(f)
 
-    if data.get("version") != "VERSION 1.3":
+    if data.get("version") != ACTIVITYNET_CONFIG['annotation_version']:
         raise RuntimeError(
             f"Unexpected ActivityNet version: {data.get('version')!r}"
         )

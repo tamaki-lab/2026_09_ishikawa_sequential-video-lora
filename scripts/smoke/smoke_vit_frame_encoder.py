@@ -7,9 +7,11 @@ from PIL import Image
 from transformers import AutoImageProcessor
 
 from model.backbones.vit import ViTFrameEncoder
+from utils.configuration import load_config_group
 
 
-CHECKPOINT_ID = "google/vit-base-patch16-224"
+ENCODER_CONFIG = load_config_group('encoder', 'vit_base_patch16_224')
+CHECKPOINT_ID = ENCODER_CONFIG['checkpoint_id']
 
 
 def main():
@@ -22,7 +24,9 @@ def main():
 
     processor = AutoImageProcessor.from_pretrained(CHECKPOINT_ID)
     pixel_values = processor(images=image, return_tensors="pt")["pixel_values"]
-    if tuple(pixel_values.shape) != (1, 3, 224, 224):
+    if tuple(pixel_values.shape) != (
+        1, ENCODER_CONFIG['channels'], ENCODER_CONFIG['image_size'], ENCODER_CONFIG['image_size'],
+    ):
         raise RuntimeError(f"Unexpected pixel_values shape: {tuple(pixel_values.shape)}")
 
     encoder = ViTFrameEncoder(CHECKPOINT_ID)
@@ -37,7 +41,7 @@ def main():
     with torch.no_grad():
         frame_features = encoder(pixel_values.to(device))
 
-    if tuple(frame_features.shape) != (1, 768):
+    if tuple(frame_features.shape) != (1, ENCODER_CONFIG['feature_size']):
         raise RuntimeError(f"Unexpected feature shape: {tuple(frame_features.shape)}")
     finite = bool(torch.isfinite(frame_features).all().item())
     if not finite:

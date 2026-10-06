@@ -18,15 +18,20 @@ from model.aggregators import MaskedMeanClipAggregator
 from model.backbones.vit import ViTLoRAFrameEncoder
 from integration.sequential_vit import encode_chunk
 from training.moco_audit import audit_encoder_parameters as audit_parameters
+from utils.configuration import load_config_group
 
 
-CHECKPOINT_ID = "google/vit-base-patch16-224"
+ENCODER_CONFIG = load_config_group('encoder', 'vit_base_patch16_224')
+SEQUENTIAL_CONFIG = load_config_group('sequential', 'default')
+MOCO_CONFIG = load_config_group('moco', 'stage6b_v2')
+PROVENANCE_CONFIG = load_config_group('provenance', 'research_v1')
+CHECKPOINT_ID = ENCODER_CONFIG['checkpoint_id']
 EXPECTED_BRANCH = "dev"
 BASE_COMMIT = "b6385d87e2e3e82a719d8f4b686b44aa293b1135"
-LOADER_BRANCH = "ActivityNet"
-LOADER_COMMIT = "19a0ed7e4c00300214bc9a2fe12da8c72c0499c0"
-FRAMES_PER_CHUNK = 16
-FEATURE_SIZE = 768
+LOADER_BRANCH = PROVENANCE_CONFIG['sequential_loader']['branch']
+LOADER_COMMIT = PROVENANCE_CONFIG['sequential_loader']['commit']
+FRAMES_PER_CHUNK = SEQUENTIAL_CONFIG['frames_per_chunk']
+FEATURE_SIZE = ENCODER_CONFIG['feature_size']
 
 
 def git_output(repository: Path, *args: str) -> str:
@@ -38,9 +43,12 @@ def git_output(repository: Path, *args: str) -> str:
 def run_one_step(encoder, clip_feature):
     """Audit a single AdamW step; this loss has no scientific interpretation."""
     if tuple(clip_feature.shape) != (FEATURE_SIZE,) or not torch.isfinite(clip_feature).all().item():
-        raise RuntimeError("Expected a finite clip feature with shape [768]")
+        raise RuntimeError(f"Expected a finite clip feature with shape [{FEATURE_SIZE}]")
     base, lora = audit_parameters(encoder)
-    optimizer = torch.optim.AdamW(list(lora.values()), lr=1.0e-3, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(
+        list(lora.values()), lr=MOCO_CONFIG['optimizer']['lr'],
+        weight_decay=MOCO_CONFIG['optimizer']['weight_decay'],
+    )
     optimized = [p for group in optimizer.param_groups for p in group['params']]
     if len(optimized) != len(lora) or {id(p) for p in optimized} != {id(p) for p in lora.values()}:
         raise RuntimeError("Optimizer parameters do not match the trainable LoRA parameters")
@@ -95,8 +103,11 @@ def main():
         raise RuntimeError(f"Expected sequential_loader {LOADER_BRANCH}@{LOADER_COMMIT}, got {loader_branch}@{loader_revision}")
     if git_output(loader_root, "status", "--porcelain", "--untracked-files=no"):
         raise RuntimeError("Pinned sequential_loader checkout has tracked changes")
-    if transformers.__version__ != "5.17.0" or peft.__version__ != "0.21.0":
-        raise RuntimeError("Stage 4 requires transformers==5.17.0 and peft==0.21.0")
+    dependencies = PROVENANCE_CONFIG['dependencies']
+    if transformers.__version__ != dependencies['transformers'] or peft.__version__ != dependencies['peft']:
+        raise RuntimeError(
+            f"Stage 4 requires transformers=={dependencies['transformers']} and peft=={dependencies['peft']}"
+        )
 
     device = torch.device(args.device)
     print(f"implementation branch: {branch}")
