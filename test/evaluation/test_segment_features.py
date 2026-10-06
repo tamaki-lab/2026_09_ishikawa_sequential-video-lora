@@ -78,6 +78,7 @@ def test_artifact_round_trip_and_rejections(setup, tmp_path):
     contract = {'manifest': dict(manifest_metadata), 'common': 'same'}
     metadata = features.write_feature_artifact(tmp_path / 'f', splits, rows, {
         'condition': 'base_vit', 'manifest': dict(manifest_metadata),
+        'feature_definition': {'size': features.FEATURE_SIZE},
         'shared_feature_contract': contract,
         'shared_feature_contract_sha256': features.shared_contract_sha256(contract)})
     assert set(metadata['files']) == {'training/features.pt', 'validation/features.pt'}
@@ -119,3 +120,12 @@ def test_changed_timestamps_are_rejected_at_extraction(setup, videos):
     videos['timestamps']['a'] = chunk_times(4, offset=0.05)
     with pytest.raises(RuntimeError, match='no longer lies'):
         extract(sources, rows, ColorEncoder())
+
+
+def test_only_the_implemented_feature_definition_is_accepted():
+    from utils.configuration import load_config_group
+    declared = load_config_group('linear_probe', 'lp_v1')['feature_definition']
+    assert features.validate_feature_definition(declared) == features.FEATURE_DEFINITION
+    for key, value in (('normalization', 'l2'), ('chunk_aggregation', 'max over valid frames')):
+        with pytest.raises(ValueError, match='implemented feature definition'):
+            features.validate_feature_definition({**declared, key: value})

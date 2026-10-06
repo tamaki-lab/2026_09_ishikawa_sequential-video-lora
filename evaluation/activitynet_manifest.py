@@ -16,30 +16,40 @@ import torch
 from integration.sequential_stream import ordered_samples
 from utils.artifact_io import canonical_json_bytes, read_json, sha256_file, write_bytes_atomic
 from utils.artifact_io import write_json_atomic
+from utils.configuration import load_config_group
 
 
-MANIFEST_SCHEMA = 'activitynet-linear-probe-manifest/v1'
+MANIFEST_SCHEMA = 'activitynet-linear-probe-manifest/v2'
 MANIFEST_FILE = 'activitynet_linear_probe_manifest.jsonl'
 MAPPING_FILE = 'label_mapping.json'
 SPLITS = ('training', 'validation')
-SPLIT_COUNTS = {'training': 10_024, 'validation': 4_926}
-CLASS_COUNT = 200
+_ACTIVITYNET_CONFIG = load_config_group('activitynet', 'v1_3')
+_SEQUENTIAL_CONFIG = load_config_group('sequential', 'default')
+# Compatibility aliases for direct library use. Hydra entry points always pass
+# the resolved values explicitly; these aliases also come from the same YAML.
+SPLIT_COUNTS = dict(_ACTIVITYNET_CONFIG['expected_source_counts'])
+CLASS_COUNT = _ACTIVITYNET_CONFIG['class_count']
+ANNOTATION_VERSION = _ACTIVITYNET_CONFIG['annotation_version']
+FRAMES_PER_CHUNK = _SEQUENTIAL_CONFIG['frames_per_chunk']
 CHUNK_RULE = 'all valid timestamps finite and within closed [segment_start, segment_end]; >=1 valid frame'
 
 
 class AnnotationIndex:
     """Resolve Adapter `evaluation_reference`s to v1.3 annotation entries."""
 
-    def __init__(self):
+    def __init__(self, expected_version=None):
         self._databases = {}
+        self.expected_version = ANNOTATION_VERSION if expected_version is None else expected_version
+        if not isinstance(self.expected_version, str) or not self.expected_version:
+            raise ValueError('expected annotation version must be a non-empty string')
 
     def database(self, path):
         path = Path(path)
         if path not in self._databases:
             with path.open(encoding='utf-8') as file:
                 annotation = json.load(file)
-            if annotation.get('version') != 'VERSION 1.3':
-                raise ValueError('ActivityNet annotation version must be VERSION 1.3')
+            if annotation.get('version') != self.expected_version:
+                raise ValueError(f'ActivityNet annotation version must be {self.expected_version}')
             self._databases[path] = annotation['database']
         return self._databases[path]
 
@@ -60,17 +70,20 @@ class AnnotationIndex:
         return result
 
 
-def canonical_label_mapping(index, sources_by_split):
-    """Sort the shared 200-label set once and assign 0..199."""
+def canonical_label_mapping(index, sources_by_split, expected_class_count=None):
+    """Sort the shared label set once and assign contiguous class IDs."""
+    expected_class_count = CLASS_COUNT if expected_class_count is None else expected_class_count
+    if type(expected_class_count) is not int or expected_class_count < 1:
+        raise ValueError('expected_class_count must be a positive integer')
     label_sets = {
         split: {item['label'] for source in sources for item in index.annotations(source.evaluation_reference)}
         for split, sources in sources_by_split.items()
     }
-    if any(len(labels) != CLASS_COUNT for labels in label_sets.values()) or len(
+    if any(len(labels) != expected_class_count for labels in label_sets.values()) or len(
         {frozenset(labels) for labels in label_sets.values()}
     ) != 1:
         counts = {split: len(labels) for split, labels in label_sets.items()}
-        raise RuntimeError(f'Expected the same {CLASS_COUNT} labels in every split: {counts}')
+        raise RuntimeError(f'Expected the same {expected_class_count} labels in every split: {counts}')
     return {label: label_id for label_id, label in enumerate(sorted(label_sets[SPLITS[0]]))}
 
 
@@ -78,10 +91,13 @@ def chunk_in_segment(sample, start, end):
     return contained(sample.timestamps[sample.valid_mask], start, end)
 
 
-def video_chunk_timestamps(source):
+def video_chunk_timestamps(source, frames_per_chunk=None):
     """Valid raw timestamps of every chunk, in chronological chunk order."""
+    frames_per_chunk = FRAMES_PER_CHUNK if frames_per_chunk is None else frames_per_chunk
     chunks = []
-    with ordered_samples((source,), stream_mode='strict_single') as samples:
+    with ordered_samples(
+        (source,), stream_mode='strict_single', frames_per_chunk=frames_per_chunk,
+    ) as samples:
         for sample in samples:
             if sample.sequence_index != len(chunks):
                 raise RuntimeError('Chunk order changed while scanning timestamps')
@@ -114,13 +130,17 @@ def video_rows(split, source, annotations, mapping, chunks):
     return rows, skipped
 
 
-def build_manifest(index, sources_by_split, mapping, progress=None):
+def build_manifest(index, sources_by_split, mapping, frames_per_chunk=None, progress=None):
     """Rows in split -> Adapter source order -> annotation_index order."""
+    frames_per_chunk = FRAMES_PER_CHUNK if frames_per_chunk is None else frames_per_chunk
     rows, skips = [], {split: Counter() for split in sources_by_split}
     for split in SPLITS:
         for position, source in enumerate(sources_by_split[split]):
             annotations = index.annotations(source.evaluation_reference)
-            video, skipped = video_rows(split, source, annotations, mapping, video_chunk_timestamps(source))
+            video, skipped = video_rows(
+                split, source, annotations, mapping,
+                video_chunk_timestamps(source, frames_per_chunk),
+            )
             rows.extend(video)
             skips[split].update(skipped)
             if progress:
@@ -132,15 +152,18 @@ def manifest_bytes(rows):
     return b''.join(canonical_json_bytes(row) + b'\n' for row in rows)
 
 
-def integrity_gate(rows, mapping, mapping_sha256, metadata_mapping_sha256):
+def integrity_gate(rows, mapping, mapping_sha256, metadata_mapping_sha256, expected_class_count=None):
     """Checks 1-8 of the Dataset Integrity Gate. Check 9 is the audit rebuild."""
+    expected_class_count = CLASS_COUNT if expected_class_count is None else expected_class_count
+    if type(expected_class_count) is not int or expected_class_count < 1:
+        raise ValueError('expected_class_count must be a positive integer')
     labels = {split: Counter(row['label_id'] for row in rows if row['split'] == split) for split in SPLITS}
     ids = [row['segment_id'] for row in rows]
     split_ids = {split: {row['segment_id'] for row in rows if row['split'] == split} for split in SPLITS}
     every_class = set(mapping.values())
     checks = {
-        '1_training_labels_200': len(labels['training']) == CLASS_COUNT,
-        '2_validation_labels_200': len(labels['validation']) == CLASS_COUNT,
+        f'1_training_labels_{expected_class_count}': len(labels['training']) == expected_class_count,
+        f'2_validation_labels_{expected_class_count}': len(labels['validation']) == expected_class_count,
         '3_training_sample_per_class': set(labels['training']) == every_class,
         '4_validation_sample_per_class': set(labels['validation']) == every_class,
         '5_no_duplicate_segment_id': len(ids) == len(set(ids)),

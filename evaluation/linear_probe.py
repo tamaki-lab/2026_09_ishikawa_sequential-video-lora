@@ -6,9 +6,11 @@ an epoch. Metrics: Top-1 (primary) and Macro class accuracy (secondary).
 """
 
 import csv
+from dataclasses import dataclass, replace
 import io
 import math
 from pathlib import Path
+from typing import Mapping
 
 import numpy
 import torch
@@ -16,42 +18,158 @@ from torch import nn
 from torch.nn import functional as F
 
 from utils.artifact_io import read_json, sha256_file, write_bytes_atomic, write_json_atomic
+from utils.configuration import load_config_group
 
 
-RESULT_SCHEMA = 'activitynet-linear-probe-result/v1'
-AGGREGATE_SCHEMA = 'activitynet-linear-probe-aggregate/v1'
-PROTOCOL = 'lp-v1'
-FEATURE_SIZE = 768
-CLASS_COUNT = 200
-SEEDS = (0, 1, 2)
-HYPERPARAMETERS = {
-    'classifier': 'Linear(768, 200, bias=True)', 'loss': 'cross_entropy', 'class_weight': None,
-    'optimizer': 'AdamW', 'lr': 1e-3, 'weight_decay': 1e-4, 'batch_size': 256, 'epochs': 100,
-    'scheduler': None, 'train_shuffle': True, 'validation_shuffle': False, 'early_stopping': False,
-}
+RESULT_SCHEMA = 'activitynet-linear-probe-result/v2'
+AGGREGATE_SCHEMA = 'activitynet-linear-probe-aggregate/v2'
 RESULT_FILES = ('probe_classifier.pt', 'summary.json', 'history.csv', 'per_class_accuracy.csv',
                 'confusion_matrix.npy')
 
 
-def experiment_name(condition, seed):
-    return f'{PROTOCOL}__{condition.replace("_", "-")}__seed-{seed}'
+@dataclass(frozen=True)
+class ProbeConfig:
+    """Resolved scientific probe config shared by execution and metadata."""
+
+    protocol: str
+    seeds: tuple
+    classifier_bias: bool
+    loss: str
+    class_weight: object
+    optimizer: str
+    lr: float
+    weight_decay: float
+    betas: tuple
+    eps: float
+    batch_size: int
+    epochs: int
+    scheduler: object
+    train_shuffle: bool
+    validation_shuffle: bool
+    early_stopping: bool
+
+    @classmethod
+    def from_mapping(cls, protocol, value: Mapping):
+        classifier = value['classifier']
+        loss = value['loss']
+        optimizer = value['optimizer']
+        return cls(
+            protocol=protocol,
+            seeds=tuple(value['seeds']),
+            classifier_bias=classifier['bias'],
+            loss=loss['name'],
+            class_weight=loss['class_weight'],
+            optimizer=optimizer['name'],
+            lr=optimizer['lr'],
+            weight_decay=optimizer['weight_decay'],
+            betas=tuple(optimizer['betas']),
+            eps=optimizer['eps'],
+            batch_size=value['batch_size'],
+            epochs=value['epochs'],
+            scheduler=value['scheduler'],
+            train_shuffle=value['train_shuffle'],
+            validation_shuffle=value['validation_shuffle'],
+            early_stopping=value['early_stopping'],
+        )
+
+    def __post_init__(self):
+        if not isinstance(self.protocol, str) or not self.protocol:
+            raise ValueError('protocol must be a non-empty string')
+        if not self.seeds or any(type(seed) is not int or seed < 0 for seed in self.seeds):
+            raise ValueError('seeds must be non-empty non-negative integers')
+        if len(set(self.seeds)) != len(self.seeds):
+            raise ValueError('seeds must be unique')
+        if self.classifier_bias is not True:
+            raise ValueError('Only a biased linear classifier is implemented')
+        if self.loss != 'cross_entropy' or self.class_weight is not None:
+            raise ValueError('Only unweighted cross_entropy is implemented')
+        if self.optimizer != 'AdamW':
+            raise ValueError('Only AdamW is implemented')
+        if not isinstance(self.lr, (int, float)) or self.lr <= 0:
+            raise ValueError('lr must be positive')
+        if not isinstance(self.weight_decay, (int, float)) or self.weight_decay < 0:
+            raise ValueError('weight_decay must be non-negative')
+        if len(self.betas) != 2 or any(not isinstance(beta, float) or not 0 <= beta < 1 for beta in self.betas):
+            raise ValueError('betas must be two floats in [0, 1)')
+        if not isinstance(self.eps, float) or self.eps <= 0:
+            raise ValueError('eps must be a positive float')
+        if type(self.batch_size) is not int or self.batch_size < 1:
+            raise ValueError('batch_size must be a positive integer')
+        if type(self.epochs) is not int or self.epochs < 0:
+            raise ValueError('epochs must be a non-negative integer')
+        if self.scheduler is not None or self.train_shuffle is not True or self.validation_shuffle is not False:
+            raise ValueError('Only shuffled training without a scheduler or validation shuffle is implemented')
+        if self.early_stopping is not False:
+            raise ValueError('Early stopping is not implemented')
+
+    def with_epochs(self, epochs):
+        return replace(self, epochs=epochs)
+
+    def hyperparameters(self, feature_size, class_count):
+        return {
+            'classifier': {
+                'class': 'Linear', 'in_features': feature_size, 'out_features': class_count,
+                'bias': self.classifier_bias,
+            },
+            'loss': {'name': self.loss, 'class_weight': self.class_weight},
+            'optimizer': {'name': self.optimizer, 'lr': self.lr, 'weight_decay': self.weight_decay,
+                          'betas': list(self.betas), 'eps': self.eps},
+            'batch_size': self.batch_size, 'epochs': self.epochs, 'scheduler': self.scheduler,
+            'train_shuffle': self.train_shuffle, 'validation_shuffle': self.validation_shuffle,
+            'early_stopping': self.early_stopping,
+        }
 
 
-def train_probe(features, labels, seed, epochs, *, batch_size=256, lr=1e-3, weight_decay=1e-4, on_epoch=None):
-    """Train a fresh classifier; features are never modified."""
-    if features.requires_grad or features.dtype != torch.float32 or tuple(features.shape[1:]) != (FEATURE_SIZE,):
-        raise ValueError('Expected frozen float32 features [N, 768]')
+_PROBE_PRESET = load_config_group('linear_probe', 'lp_v1')
+_ENCODER_PRESET = load_config_group('encoder', 'vit_base_patch16_224')
+_ACTIVITYNET_PRESET = load_config_group('activitynet', 'v1_3')
+DEFAULT_CONFIG = ProbeConfig.from_mapping(_PROBE_PRESET['id'], _PROBE_PRESET['probe'])
+# Backward-compatible library aliases. They are views of the Hydra presets,
+# not independent defaults.
+PROTOCOL = DEFAULT_CONFIG.protocol
+FEATURE_SIZE = _ENCODER_PRESET['feature_size']
+CLASS_COUNT = _ACTIVITYNET_PRESET['class_count']
+SEEDS = DEFAULT_CONFIG.seeds
+HYPERPARAMETERS = DEFAULT_CONFIG.hyperparameters(FEATURE_SIZE, CLASS_COUNT)
+
+
+def experiment_name(protocol, condition=None, seed=None):
+    if seed is None:
+        # Legacy two-argument form: experiment_name(condition, seed).
+        protocol, condition, seed = PROTOCOL, protocol, condition
+    return f'{protocol}__{condition.replace("_", "-")}__seed-{seed}'
+
+
+def train_probe(features, labels, seed, config=None, class_count=None, *, on_epoch=None):
+    """Train a fresh classifier; features are never modified.
+
+    Every hyperparameter comes from `config`, the same object callers record.
+    """
+    config = DEFAULT_CONFIG if config is None else config
+    if not isinstance(config, ProbeConfig):
+        raise TypeError('config must be a ProbeConfig')
+    class_count = CLASS_COUNT if class_count is None else class_count
+    if features.ndim != 2 or not features.shape[1] or features.requires_grad or features.dtype != torch.float32:
+        raise ValueError('Expected non-empty-width frozen float32 features [N, D]')
+    if labels.ndim != 1 or labels.dtype != torch.int64 or len(labels) != len(features) or not len(labels):
+        raise ValueError('Expected non-empty int64 labels [N] aligned with features')
+    if type(class_count) is not int or class_count < 1 or labels.min().item() < 0 or labels.max().item() >= class_count:
+        raise ValueError('Labels must be in [0, class_count)')
+    if seed not in config.seeds:
+        raise ValueError(f'seed {seed} is not in the configured seeds')
     torch.manual_seed(seed)
     # Initialized on CPU from the seed, then moved, so the device never changes the init.
-    classifier = nn.Linear(FEATURE_SIZE, CLASS_COUNT, bias=True).to(features.device)
+    classifier = nn.Linear(features.shape[1], class_count, bias=config.classifier_bias).to(features.device)
     shuffle = torch.Generator().manual_seed(seed)
-    optimizer = torch.optim.AdamW(classifier.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        classifier.parameters(), lr=config.lr, weight_decay=config.weight_decay, betas=config.betas, eps=config.eps,
+    )
     history = []
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, config.epochs + 1):
         order = torch.randperm(len(features), generator=shuffle)
         loss_sum, correct = 0., 0
-        for start in range(0, len(order), batch_size):
-            batch = order[start:start + batch_size]
+        for start in range(0, len(order), config.batch_size):
+            batch = order[start:start + config.batch_size]
             logits = classifier(features[batch])
             loss = F.cross_entropy(logits, labels[batch])
             if not torch.isfinite(loss).item():
@@ -70,8 +188,16 @@ def train_probe(features, labels, seed, epochs, *, batch_size=256, lr=1e-3, weig
 
 @torch.no_grad()
 def evaluate(classifier, features, labels):
-    predictions = classifier(features).argmax(dim=1)
-    confusion = torch.zeros(CLASS_COUNT, CLASS_COUNT, dtype=torch.int64)
+    if features.ndim != 2 or features.shape[1] != classifier.in_features or not len(features):
+        raise ValueError('Evaluation features do not match the classifier')
+    if labels.ndim != 1 or labels.dtype != torch.int64 or len(labels) != len(features):
+        raise ValueError('Evaluation labels must be int64 [N] aligned with features')
+    predictions = classifier(features).argmax(dim=1).cpu()
+    labels = labels.cpu()
+    class_count = classifier.out_features
+    if labels.min().item() < 0 or labels.max().item() >= class_count:
+        raise ValueError('Evaluation labels are outside the classifier classes')
+    confusion = torch.zeros(class_count, class_count, dtype=torch.int64)
     confusion.index_put_((labels, predictions), torch.ones_like(labels), accumulate=True)
     support = confusion.sum(dim=1)
     correct = confusion.diagonal()

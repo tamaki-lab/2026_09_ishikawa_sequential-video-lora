@@ -1,0 +1,29 @@
+defaults:
+  - activitynet: v1_3
+  - encoder: vit_base_patch16_224
+  - sequential: default
+  - moco: stage6b_v2
+  - provenance: research_v1
+  - linear_probe: lp_v1
+  - tracking: default
+  - _self_
+
+runtime:
+  manifest_id: ${linear_probe.id}
+  base_features: ???
+  lora_features: ???
+  device: cpu
+  output_root: log/linear_probe
+  result_id: null
+
+logging:
+  disable_comet: false
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: log/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+  sweep:
+    dir: log/hydra/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+    subdir: ${hydra.job.num}

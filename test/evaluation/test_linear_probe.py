@@ -1,6 +1,7 @@
 """Linear Probe: fixed classifier, seed scope, metrics, aggregation and artifacts."""
 
 import csv
+from dataclasses import replace
 import io
 import json
 
@@ -9,6 +10,10 @@ import pytest
 import torch
 
 from evaluation import linear_probe as probe
+
+
+def epochs(count):
+    return probe.DEFAULT_CONFIG.with_epochs(count)
 
 
 def data(count=300, seed=0):
@@ -22,23 +27,24 @@ def data(count=300, seed=0):
 def test_only_classifier_is_trained_and_features_are_untouched():
     features, labels = data()
     before = features.clone()
-    classifier, history = probe.train_probe(features, labels, seed=0, epochs=3)
+    classifier, history = probe.train_probe(features, labels, seed=0, config=epochs(3))
     assert isinstance(classifier, torch.nn.Linear)
     assert (classifier.in_features, classifier.out_features, classifier.bias is not None) == (768, 200, True)
     assert torch.equal(features, before) and not features.requires_grad and features.grad is None
     assert [row['epoch'] for row in history] == [1, 2, 3]
     assert history[-1]['train_loss'] < history[0]['train_loss']
     with pytest.raises(ValueError, match='frozen'):
-        probe.train_probe(features.requires_grad_(), labels, seed=0, epochs=1)
+        probe.train_probe(features.requires_grad_(), labels, seed=0, config=epochs(1))
 
 
 def test_seed_controls_only_init_and_shuffle():
     features, labels = data()
-    init = {seed: probe.train_probe(features, labels, seed=seed, epochs=0)[0].weight.detach() for seed in (0, 1)}
+    init = {seed: probe.train_probe(features, labels, seed=seed, config=epochs(0))[0].weight.detach()
+            for seed in (0, 1)}
     torch.manual_seed(1234)
     torch.rand(10)  # Unrelated global RNG use must not change a seeded run.
-    again = probe.train_probe(features, labels, seed=0, epochs=2)
-    reference = probe.train_probe(features, labels, seed=0, epochs=2)
+    again = probe.train_probe(features, labels, seed=0, config=epochs(2))
+    reference = probe.train_probe(features, labels, seed=0, config=epochs(2))
     assert torch.equal(again[0].weight, reference[0].weight) and again[1] == reference[1]
     assert not torch.equal(init[0], init[1])
     orders = []
@@ -49,8 +55,8 @@ def test_seed_controls_only_init_and_shuffle():
         return orders[-1]
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(torch, 'randperm', record)
-        probe.train_probe(features, labels, seed=0, epochs=1)
-        probe.train_probe(features, labels, seed=1, epochs=1)
+        probe.train_probe(features, labels, seed=0, config=epochs(1))
+        probe.train_probe(features, labels, seed=1, config=epochs(1))
     assert len(orders) == 2 and not torch.equal(orders[0], orders[1])
 
 
@@ -93,7 +99,7 @@ def test_mean_and_sample_std_and_aggregate():
 
 def test_result_files_round_trip_and_tamper_detection(tmp_path):
     features, labels = data(64)
-    classifier, history = probe.train_probe(features, labels, seed=0, epochs=2)
+    classifier, history = probe.train_probe(features, labels, seed=0, config=epochs(2))
     metrics = probe.evaluate(classifier, features, labels)
     summary = probe.write_result(tmp_path, classifier, history, metrics, {
         'schema': probe.RESULT_SCHEMA, 'condition': 'base_vit', 'seed': 0, 'top1': metrics['top1'],
@@ -106,3 +112,21 @@ def test_result_files_round_trip_and_tamper_detection(tmp_path):
     (tmp_path / 'history.csv').write_text('changed')
     with pytest.raises(RuntimeError, match='hashes'):
         probe.load_summary(tmp_path)
+
+
+def test_optimizer_is_built_from_the_recorded_config(monkeypatch):
+    features, labels = data(32)
+    config = replace(epochs(1), lr=5e-4, weight_decay=0.0, betas=(0.8, 0.99), eps=1e-6)
+    created = []
+    factory = torch.optim.AdamW
+
+    def record(parameters, **kwargs):
+        created.append(kwargs)
+        return factory(parameters, **kwargs)
+    monkeypatch.setattr(torch.optim, 'AdamW', record)
+    probe.train_probe(features, labels, seed=0, config=config)
+    recorded = config.hyperparameters(768, probe.CLASS_COUNT)['optimizer']
+    assert created == [{key: recorded[key] if key != 'betas' else tuple(recorded[key])
+                        for key in ('lr', 'weight_decay', 'betas', 'eps')}]
+    with pytest.raises(ValueError, match='betas'):
+        replace(config, betas=(0.9,))

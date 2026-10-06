@@ -1,0 +1,33 @@
+id: lp-v1
+
+conditions:
+  base_vit: {}
+  moco_query_lora_final: {}
+
+feature_definition:
+  schema: activitynet-segment-feature-definition/v2
+  frame_feature: ViT CLS without pooler
+  chunk_aggregation: masked mean over valid frames
+  segment_aggregation: mean over manifest chunks
+  dtype: float32
+  normalization: null
+
+probe:
+  seeds: [0, 1, 2]
+  classifier:
+    bias: true
+  loss:
+    name: cross_entropy
+    class_weight: null
+  optimizer:
+    name: AdamW
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  batch_size: 256
+  epochs: 100
+  scheduler: null
+  train_shuffle: true
+  validation_shuffle: false
+  early_stopping: false

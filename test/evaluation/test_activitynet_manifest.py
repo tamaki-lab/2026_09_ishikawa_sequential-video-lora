@@ -79,7 +79,7 @@ def row(split, video, index, label_id, chunks=(0,)):
 
 
 @pytest.mark.parametrize('case,failed', [
-    ('missing_class', ['3_training_sample_per_class', '1_training_labels_200']),
+    ('missing_class', ['3_training_sample_per_class', '1_training_labels_2']),
     ('duplicate', ['5_no_duplicate_segment_id']),
     ('chunk_count', ['7_chunk_count_consistent']),
     ('mapping', ['8_label_mapping_hash_matches']),
