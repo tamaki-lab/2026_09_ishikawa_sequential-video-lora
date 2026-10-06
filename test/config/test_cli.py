@@ -82,3 +82,16 @@ with patch("logger.configure_logger", side_effect=stop_before_training), \\
     assert "Resolved config:" in log
     assert "save_dir: relative-data/checkpoints" in log
     assert "${dataset.root}" not in log
+
+
+@pytest.mark.parametrize("module,expected", [
+    ("scripts.moco.train_full_streaming_moco", "queue_capacity: 4096"),
+    ("scripts.linear_probe.build_manifest", "command: ???"),
+    ("scripts.linear_probe.extract_features", "condition: ???"),
+    ("scripts.linear_probe.run_probe", "epochs: 100"),
+])
+def test_research_entrypoints_expose_hydra_config_without_running(module, expected, tmp_path):
+    result = run_python(["-m", module, "--cfg", "job"], tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert expected in result.stdout
+    assert not (tmp_path / "log").exists()
