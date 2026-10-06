@@ -9,14 +9,17 @@ from torch import nn
 from torch.nn import functional as F
 
 from model.backbones.vit import ViTLoRAFrameEncoder
+from utils.configuration import load_config_group
 from .negative_selection import select_negatives
 
 
-FEATURE_SIZE = 768
-PROJECTION_SIZE = 128
-QUEUE_CAPACITY = 4096
-MOMENTUM = 0.999
-TEMPERATURE = 0.07
+_ENCODER_CONFIG = load_config_group('encoder', 'vit_base_patch16_224')
+_MOCO_CONFIG = load_config_group('moco', 'stage6b_v2')
+FEATURE_SIZE = _ENCODER_CONFIG['feature_size']
+PROJECTION_SIZE = _MOCO_CONFIG['projection_size']
+QUEUE_CAPACITY = _MOCO_CONFIG['queue_capacity']
+MOMENTUM = _MOCO_CONFIG['momentum']
+TEMPERATURE = _MOCO_CONFIG['temperature']
 
 
 def lora_parameters(encoder):
@@ -26,9 +29,9 @@ def lora_parameters(encoder):
     }
 
 
-def require_normalized(vector):
-    if tuple(vector.shape) != (PROJECTION_SIZE,) or not torch.isfinite(vector).all().item():
-        raise RuntimeError('Expected a finite projected vector [128]')
+def require_normalized(vector, projection_size=PROJECTION_SIZE):
+    if tuple(vector.shape) != (projection_size,) or not torch.isfinite(vector).all().item():
+        raise RuntimeError(f'Expected a finite projected vector [{projection_size}]')
     if not torch.allclose(vector.norm(), vector.new_tensor(1.), rtol=1e-5, atol=1e-6):
         raise RuntimeError('Expected an L2-normalized projected vector')
 
@@ -43,10 +46,13 @@ class QueueEntry:
 class MetadataQueue:
     """FIFO storage of detached keys and their source metadata."""
 
-    def __init__(self, capacity=QUEUE_CAPACITY):
+    def __init__(self, capacity=QUEUE_CAPACITY, projection_size=PROJECTION_SIZE):
         if not isinstance(capacity, int) or capacity <= 0:
             raise ValueError('Queue capacity must be a positive integer')
+        if not isinstance(projection_size, int) or projection_size <= 0:
+            raise ValueError('Queue projection size must be a positive integer')
         self.capacity = capacity
+        self.projection_size = projection_size
         self._entries = deque(maxlen=capacity)
 
     def __len__(self):
@@ -57,7 +63,7 @@ class MetadataQueue:
         return tuple(self._entries)
 
     def enqueue(self, key, sequence_id, sequence_index):
-        require_normalized(key)
+        require_normalized(key, self.projection_size)
         if not isinstance(sequence_id, str) or not sequence_id:
             raise ValueError('sequence_id must be non-empty')
         if type(sequence_index) is not int or sequence_index < 0:
@@ -78,37 +84,54 @@ class ViTLoRAMoCo(nn.Module):
     Queue entries are runtime state only; checkpoint/resume is outside Stage 5.
     """
 
-    def __init__(self, query_encoder=None):
+    def __init__(
+        self, query_encoder=None, *, config=None, feature_size=None, projection_size=PROJECTION_SIZE,
+        queue_capacity=QUEUE_CAPACITY, momentum=MOMENTUM, temperature=TEMPERATURE,
+    ):
         super().__init__()
+        if config is not None:
+            projection_size, queue_capacity = config.projection_size, config.queue_capacity
+            momentum, temperature = config.momentum, config.temperature
         self.query_encoder = query_encoder if query_encoder is not None else ViTLoRAFrameEncoder()
+        self.feature_size = getattr(self.query_encoder, 'feature_size', FEATURE_SIZE) \
+            if feature_size is None else feature_size
+        if type(self.feature_size) is not int or self.feature_size <= 0:
+            raise ValueError('feature_size must be a positive integer')
+        if type(projection_size) is not int or projection_size <= 0:
+            raise ValueError('projection_size must be a positive integer')
+        if type(queue_capacity) is not int or queue_capacity <= 0:
+            raise ValueError('queue_capacity must be a positive integer')
+        if not 0.0 <= momentum < 1.0 or temperature <= 0:
+            raise ValueError('momentum must be in [0, 1) and temperature must be positive')
+        self.projection_size = projection_size
         self.key_encoder = deepcopy(self.query_encoder).requires_grad_(False)
         self.query_projector = nn.Sequential(
-            nn.Linear(FEATURE_SIZE, FEATURE_SIZE),
+            nn.Linear(self.feature_size, self.feature_size),
             nn.ReLU(),
-            nn.Linear(FEATURE_SIZE, PROJECTION_SIZE),
+            nn.Linear(self.feature_size, self.projection_size),
         )
         self.key_projector = deepcopy(self.query_projector).requires_grad_(False)
-        self.queue = MetadataQueue()
-        self.momentum = MOMENTUM
-        self.temperature = TEMPERATURE
+        self.queue = MetadataQueue(queue_capacity, self.projection_size)
+        self.momentum = momentum
+        self.temperature = temperature
 
     def query_parameters(self):
         return list(lora_parameters(self.query_encoder).values()) + list(self.query_projector.parameters())
 
     def project_query(self, clip_feature):
         q = F.normalize(self.query_projector(clip_feature), dim=-1)
-        require_normalized(q)
+        require_normalized(q, self.projection_size)
         return q
 
     @torch.no_grad()
     def project_key(self, clip_feature):
         k = F.normalize(self.key_projector(clip_feature), dim=-1)
-        require_normalized(k)
+        require_normalized(k, self.projection_size)
         return k
 
     def contrastive_loss(self, query, positive_key, sequence_id, *, negatives=None):
-        require_normalized(query)
-        require_normalized(positive_key)
+        require_normalized(query, self.projection_size)
+        require_normalized(positive_key, self.projection_size)
         entries = self.queue.negatives(sequence_id) if negatives is None else tuple(negatives)
         if not entries:
             raise RuntimeError('No valid negatives supplied for InfoNCE')
