@@ -34,7 +34,28 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def collect_provenance():
+def device_identity(device):
+    """Stable identity of the selected device and visible CUDA device order."""
+    device = torch.device(device)
+    if device.type == 'cpu':
+        return {'type': 'cpu'}
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        raise RuntimeError(f'Unavailable production device: {device}')
+    selected = torch.cuda.current_device() if device.index is None else device.index
+
+    def cuda_device(index):
+        properties = torch.cuda.get_device_properties(index)
+        uuid = getattr(properties, 'uuid', None)
+        return {
+            'index': index, 'name': properties.name, 'total_memory': int(properties.total_memory),
+            'uuid': None if uuid is None else str(uuid),
+        }
+
+    visible = [cuda_device(index) for index in range(torch.cuda.device_count())]
+    return {'type': 'cuda', 'selected_index': selected, 'selected': visible[selected], 'visible_devices': visible}
+
+
+def collect_provenance(*, require_clean=False):
     """Fail on an unexpected repository or pinned loader; record dirty state.
 
     Tracked changes in this repository are recorded rather than refused, so
@@ -44,18 +65,18 @@ def collect_provenance():
     origin = git_output(root, 'remote', 'get-url', 'origin')
     if origin not in REPOSITORY_URLS:
         raise RuntimeError(f'Unexpected implementation repository: {origin}')
-    dirty = git_output(root, 'status', '--porcelain', '--untracked-files=no')
+    dirty = git_output(root, 'status', '--porcelain', '--untracked-files=all')
     loader_root = Path(sl.__file__).resolve().parent.parent
     loader = {
         'branch': git_output(loader_root, 'branch', '--show-current'),
         'commit': git_output(loader_root, 'rev-parse', 'HEAD'),
-        'dirty': bool(git_output(loader_root, 'status', '--porcelain', '--untracked-files=no')),
+        'dirty': bool(git_output(loader_root, 'status', '--porcelain', '--untracked-files=all')),
     }
     if (loader['branch'], loader['commit']) != (LOADER_BRANCH, LOADER_COMMIT) or loader['dirty']:
         raise RuntimeError(f'Unexpected or modified sequential_loader checkout: {loader}')
     if (transformers.__version__, peft.__version__) != (TRANSFORMERS_VERSION, PEFT_VERSION):
         raise RuntimeError(f'Requires transformers=={TRANSFORMERS_VERSION} and peft=={PEFT_VERSION}')
-    return {
+    provenance = {
         'implementation': {
             'repository': REPOSITORY,
             'origin': origin,
@@ -78,3 +99,9 @@ def collect_provenance():
             'sequential_loader': sl.__version__,
         }.items()},
     }
+    if require_clean and provenance['implementation']['dirty']:
+        raise RuntimeError(
+            'Production execution requires a clean implementation checkout; found: '
+            f'{provenance["implementation"]["dirty_files"]}'
+        )
+    return provenance

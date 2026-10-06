@@ -19,8 +19,8 @@ from integration.sequential_stream import ordered_samples
 from logger.comet_lineage import log_artifact, log_metrics
 from training.moco_audit import audit_initial_state, audit_parameters, audit_views, parameter_groups
 from training.moco_checkpoint import (
-    PROTOCOL_VERSION, SNAPSHOT_FILES, base_fingerprint, load_resume_checkpoint, lora_config,
-    optimizer_config, ordered_source_sha256, restore_rng_state, restore_training_state,
+    PROTOCOL_VERSION, SNAPSHOT_FILES, base_fingerprint, encoder_base_fingerprint, load_resume_checkpoint,
+    lora_config, optimizer_config, ordered_source_sha256, restore_rng_state, restore_training_state,
     save_resume_checkpoint, snapshot_name, training_state, validate_resume_identity, write_evaluation_snapshot,
 )
 from training.moco_protocol import STAGE6B_PROTOCOL
@@ -28,7 +28,7 @@ from training.streaming_moco import (
     audit_bases, audit_finite, audit_queue, count_changed, enqueue_key, train_step,
 )
 from utils.artifact_io import read_json, write_json_atomic
-from utils.provenance import utc_now
+from utils.provenance import device_identity, utc_now
 
 
 ACTIVITYNET_TRAINING_COUNT = 10_024
@@ -98,19 +98,22 @@ def mean_grad(rows):
     return sum(row['gradients']['query LoRA']['norm'] for row in rows) / len(rows)
 
 
-def run_identity(moco, optimizer, run_id, source_ids, provenance, base_fingerprints):
+def run_identity(moco, optimizer, run_id, source_ids, provenance, base_fingerprints, run_config, runtime_device):
+    implementation = provenance['implementation']
     return {
         'run_id': run_id, 'protocol_version': PROTOCOL_VERSION,
         'protocol': {'stream_mode': STAGE6B_PROTOCOL.stream_mode, 'key_transform': STAGE6B_PROTOCOL.key_transform,
                      'negative_policy': STAGE6B_PROTOCOL.negative_policy},
-        'repository': provenance['implementation']['repository'],
-        'commit': provenance['implementation']['commit'],
+        'repository': implementation['repository'], 'branch': implementation['branch'],
+        'commit': implementation['commit'], 'dirty': implementation['dirty'],
+        'tracked_diff_sha256': implementation['tracked_diff_sha256'],
         'dependencies': {'versions': provenance.get('versions'),
                          'sequential_loader': provenance.get('sequential_loader')},
         'base_model': provenance['base_model'], 'base_fingerprints': base_fingerprints,
         'lora_config': lora_config(moco.query_encoder), 'queue_capacity': moco.queue.capacity,
         'momentum': moco.momentum, 'temperature': moco.temperature,
-        'optimizer_config': optimizer_config(optimizer),
+        'optimizer_config': optimizer_config(optimizer), 'seed': run_config['seed'],
+        'device_identity': runtime_device,
         'source_count': len(source_ids), 'ordered_source_sha256': ordered_source_sha256(source_ids),
     }
 
@@ -148,6 +151,13 @@ def run_full_streaming_moco(
     an explicit resume. Any integrity, decode or numerical failure propagates.
     """
     validate_full_sources(sources, expected_source_count)
+    if provenance.get('implementation', {}).get('dirty') is not False:
+        raise RuntimeError('Full-dataset MoCo requires a clean implementation checkout')
+    if type(run_config.get('seed')) is not int or not 0 <= run_config['seed'] < 2 ** 32:
+        raise RuntimeError('Full-dataset MoCo requires a resolved seed in [0, 2**32)')
+    runtime_device = device_identity(device)
+    if run_config.get('device_identity') != runtime_device:
+        raise RuntimeError('Resolved device identity differs from the actual training device')
     if stop_after_videos is not None and (type(stop_after_videos) is not int or stop_after_videos < 1):
         raise ValueError('stop_after_videos must be a positive integer')
     protocol = STAGE6B_PROTOCOL
@@ -164,7 +174,9 @@ def run_full_streaming_moco(
             raise RuntimeError('Resume requires a freshly constructed model')
         fingerprints = {side: base_fingerprint(getattr(moco, f'{side}_encoder')) for side in ('query', 'key')}
         optimizer = _new_optimizer(moco, groups)
-        identity = run_identity(moco, optimizer, run_id, source_ids, provenance, fingerprints)
+        identity = run_identity(
+            moco, optimizer, run_id, source_ids, provenance, fingerprints, run_config, runtime_device,
+        )
         validate_resume_identity(checkpoint['identity'], identity)
         counters = dict(checkpoint['counters'])
         if counters['next_source_id'] != (source_ids[counters['next_video_index']]
@@ -190,6 +202,7 @@ def run_full_streaming_moco(
                     'next_source_id': source_ids[0], 'final': False}
         optimizer = None
         warmed = False
+    evaluation_base_fingerprint = encoder_base_fingerprint(moco.query_encoder)
     audit_finite(moco)
     before = _device_snapshot({**groups['query base'], **groups['key base']})
     expected_queue = deque(
@@ -199,7 +212,9 @@ def run_full_streaming_moco(
     audit_queue(moco, expected_queue)
 
     def identity_now():
-        return run_identity(moco, optimizer, run_id, source_ids, provenance, fingerprints)
+        return run_identity(
+            moco, optimizer, run_id, source_ids, provenance, fingerprints, run_config, runtime_device,
+        )
 
     def snapshot_metadata(final):
         return {
@@ -207,6 +222,7 @@ def run_full_streaming_moco(
             'implementation': {key: provenance['implementation'].get(key) for key in (
                 'repository', 'branch', 'commit', 'dirty', 'tracked_diff_sha256')},
             'sequential_loader': provenance['sequential_loader'], 'base_model': provenance['base_model'],
+            'base_fingerprint': evaluation_base_fingerprint, 'versions': provenance['versions'],
             'dataset': {**run_config['dataset'], 'source_count': len(source_ids),
                         'ordered_source_sha256': ordered_source_sha256(source_ids)},
             'processed_videos': counters['processed_videos'],
@@ -214,6 +230,7 @@ def run_full_streaming_moco(
             'protocol': identity_now()['protocol'], 'queue_capacity': moco.queue.capacity,
             'momentum': moco.momentum, 'temperature': moco.temperature,
             'lora_config': lora_config(moco.query_encoder), 'optimizer_config': optimizer_config(optimizer),
+            'seed': run_config['seed'], 'device_identity': runtime_device,
             'moco_experiment_key': None if experiment is None else experiment.get_key(),
             'created': utc_now(),
         }

@@ -1,5 +1,6 @@
 """Resume payload serialization and PEFT-native Query LoRA snapshots."""
 
+from copy import deepcopy
 import json
 
 import pytest
@@ -52,9 +53,20 @@ def test_rng_state_round_trip():
     assert __import__('random').random() == expected[2]
 
 
+def test_seed_all_reproduces_python_numpy_and_torch():
+    checkpoint.seed_all(17)
+    first = (torch.rand(3), __import__('numpy').random.rand(2).tolist(), __import__('random').random())
+    checkpoint.seed_all(17)
+    assert torch.equal(torch.rand(3), first[0])
+    assert __import__('numpy').random.rand(2).tolist() == first[1]
+    assert __import__('random').random() == first[2]
+
+
 def test_identity_mismatch_and_unsupported_schema_are_rejected(tmp_path):
     with pytest.raises(RuntimeError, match='queue_capacity'):
         checkpoint.validate_resume_identity({'queue_capacity': 4096}, {'queue_capacity': 1024})
+    with pytest.raises(RuntimeError, match='seed'):
+        checkpoint.validate_resume_identity({'seed': 0}, {'seed': 1})
     torch.save({'format': 'other'}, tmp_path / 'latest.pt')
     with pytest.raises(RuntimeError, match='schema'):
         checkpoint.load_resume_checkpoint(tmp_path / 'latest.pt')
@@ -128,6 +140,62 @@ def test_snapshot_load_rejects_tampering_and_config_mismatch(encoder, tmp_path):
     with pytest.raises(RuntimeError, match='schema'):
         checkpoint.load_query_lora_snapshot(encoder, target)
     assert config['r'] == 8
+
+
+def test_base_fingerprint_is_plain_peft_wrapper_independent(encoder):  # noqa: F811
+    from transformers import ViTModel
+
+    plain = torch.nn.Module()
+    plain.vit = ViTModel(encoder.vit.get_base_model().config, add_pooling_layer=False)
+    plain.vit.load_state_dict({
+        name.replace('.base_layer.', '.'): tensor
+        for name, tensor in encoder.vit.get_base_model().state_dict().items() if '.lora_' not in name
+    }, strict=True)
+    expected = checkpoint.encoder_base_fingerprint(plain)
+    assert checkpoint.encoder_base_fingerprint(encoder) == expected
+    with torch.no_grad():
+        next(iter(lora_parameters(encoder).values())).add_(1)
+    assert checkpoint.encoder_base_fingerprint(encoder) == expected
+    with torch.no_grad():
+        next(iter(plain.vit.parameters())).add_(1)
+    assert checkpoint.encoder_base_fingerprint(plain) != expected
+
+
+def test_production_snapshot_contract_is_strict(encoder, tmp_path):  # noqa: F811
+    fingerprint = checkpoint.encoder_base_fingerprint(encoder)
+    metadata = {
+        'schema': checkpoint.SNAPSHOT_SCHEMA, 'protocol_version': checkpoint.PROTOCOL_VERSION,
+        'final': True, 'processed_videos': 10_024, 'global_update_step': 1,
+        'dataset': {'name': 'ActivityNet', 'version': '1.3', 'split': 'training',
+                    'root': str(tmp_path.resolve()), 'source_count': 10_024,
+                    'ordered_source_sha256': 'sources'},
+        'protocol': {'stream_mode': 'strict_single', 'key_transform': 'gbr_horizontal_flip',
+                     'negative_policy': 'all_past'},
+        'base_model': checkpoint.CHECKPOINT_ID, 'base_fingerprint': fingerprint,
+        'implementation': {'repository': checkpoint.REPOSITORY, 'commit': 'a' * 40, 'dirty': False,
+                           'tracked_diff_sha256': 'b' * 64},
+        'sequential_loader': {'branch': checkpoint.LOADER_BRANCH, 'commit': checkpoint.LOADER_COMMIT,
+                              'dirty': False},
+        'versions': {name: 'test' for name in (
+            'python', 'numpy', 'torch', 'transformers', 'peft', 'sequential_loader')},
+        'seed': 0, 'device_identity': {'type': 'cpu'}, 'queue_capacity': 4096,
+        'momentum': 0.999, 'temperature': 0.07, 'lora_config': checkpoint.lora_config(encoder),
+        'optimizer_config': {'class': 'AdamW', 'lr': 1.0e-3, 'weight_decay': 0.0},
+    }
+    options = dict(expected_source_sha256='sources', expected_dataset_root=tmp_path,
+                   expected_base_fingerprint=fingerprint)
+    checkpoint.validate_production_snapshot_metadata(metadata, **options)
+    for path, value in ((('final',), False), (('processed_videos',), 1),
+                        (('dataset', 'ordered_source_sha256'), 'other'),
+                        (('protocol', 'negative_policy'), 'same_video_only'),
+                        (('base_fingerprint',), 'other')):
+        changed = deepcopy(metadata)
+        target = changed
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        with pytest.raises(RuntimeError, match='contract mismatch'):
+            checkpoint.validate_production_snapshot_metadata(changed, **options)
 
 
 def test_real_provenance_survives_weights_only_checkpoint(tmp_path):

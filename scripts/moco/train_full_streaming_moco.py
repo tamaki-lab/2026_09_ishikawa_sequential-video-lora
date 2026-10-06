@@ -1,10 +1,11 @@
 """Full-dataset single-pass Stage 6B Streaming MoCo on ActivityNet training.
 
 Fresh run (the run directory must not exist):
-    python -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <id> --device cuda
+    python -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <id> --seed <seed> --device cuda
 
 Resume from log/moco/<id>/resume/latest.pt at the saved video boundary:
-    python -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <id> --device cuda --resume
+    python -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <id> --seed <same-seed> \
+        --device cuda --resume
 
 `--stop-after-videos N` pauses at the N-th completed video boundary (writes
 latest.pt, no final snapshot); intended for short smoke and resume checks.
@@ -22,17 +23,18 @@ from transformers import AutoImageProcessor
 from logger.comet_lineage import end_experiment, start_experiment
 from model.backbones.vit import ViTLoRAFrameEncoder
 from self_supervised.moco import ViTLoRAMoCo
-from training.moco_checkpoint import PROTOCOL_VERSION
+from training.moco_checkpoint import PROTOCOL_VERSION, seed_all
 from training.moco_protocol import STAGE6B_PROTOCOL
 from training import streaming_moco_full as full
 from utils.artifact_io import read_json, write_json_atomic
-from utils.provenance import CHECKPOINT_ID, collect_provenance
+from utils.provenance import CHECKPOINT_ID, collect_provenance, device_identity
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('dataset_root', type=Path)
     parser.add_argument('--run-id', required=True)
+    parser.add_argument('--seed', required=True, type=int)
     parser.add_argument('--resume', action='store_true', help='Continue from resume/latest.pt only')
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     parser.add_argument('--stop-after-videos', type=int)
@@ -43,16 +45,21 @@ def main():
         parser.error('--run-id may contain only letters, digits, ".", "_" and "-"')
     if args.stop_after_videos is not None and args.stop_after_videos < 1:
         parser.error('--stop-after-videos must be positive')
+    if not 0 <= args.seed < 2 ** 32:
+        parser.error('--seed must be in [0, 2**32)')
     if args.device == 'cuda' and not torch.cuda.is_available():
         parser.error('CUDA is not available')
 
-    provenance = {**collect_provenance(), 'base_model': CHECKPOINT_ID}
+    seed_all(args.seed)
+    provenance = {**collect_provenance(require_clean=True), 'base_model': CHECKPOINT_ID}
     device = torch.device(args.device)
+    runtime_device = device_identity(device)
+    dataset_root = args.dataset_root.resolve()
     run_dir = args.output_root / args.run_id
     config = {
-        'run_id': args.run_id, 'protocol_version': PROTOCOL_VERSION, 'resume': args.resume,
+        'run_id': args.run_id, 'protocol_version': PROTOCOL_VERSION, 'resume': args.resume, 'seed': args.seed,
         'dataset': {'name': 'ActivityNet', 'version': '1.3', 'split': 'training',
-                    'root': str(args.dataset_root)},
+                    'root': str(dataset_root)},
         'protocol': {'stream_mode': STAGE6B_PROTOCOL.stream_mode, 'key_transform': STAGE6B_PROTOCOL.key_transform,
                      'negative_policy': STAGE6B_PROTOCOL.negative_policy},
         'optimizer': {'class': 'AdamW', 'lr': full.LEARNING_RATE, 'weight_decay': full.WEIGHT_DECAY},
@@ -62,12 +69,13 @@ def main():
         'stop_after_videos': args.stop_after_videos,
         'device': str(device),
         'device_name': torch.cuda.get_device_name(device) if device.type == 'cuda' else 'cpu',
+        'device_identity': runtime_device,
         'run_dir': str(run_dir),
     }
     print('Resolved config: ' + json.dumps(config, sort_keys=True), flush=True)
     print('Provenance: ' + json.dumps(provenance, sort_keys=True), flush=True)
 
-    sources = sl.ActivityNetAdapter(dataset_root=args.dataset_root).sequence_sources('training')
+    sources = sl.ActivityNetAdapter(dataset_root=dataset_root).sequence_sources('training')
     full.validate_full_sources(sources, full.ACTIVITYNET_TRAINING_COUNT)
     existing_key = None
     if args.resume:

@@ -13,23 +13,32 @@ from scripts.moco import train_full_streaming_moco as cli_module
 
 @pytest.fixture
 def cli(monkeypatch, tmp_path):
+    events = []
     sources = tuple(sl.SequenceSource(sequence_id=f'v{index}', source_id=f'v{index}', source=Path('x.mp4'),
                                       start_frame=0, stop_frame=None) for index in range(10_024))
     adapter = Mock()
     adapter.sequence_sources.return_value = sources
     monkeypatch.setattr(sl, 'ActivityNetAdapter', Mock(return_value=adapter))
-    monkeypatch.setattr(cli_module, 'collect_provenance', lambda: {'implementation': {}})
+    provenance = Mock(return_value={
+        'implementation': {'dirty': False}, 'sequential_loader': {}, 'versions': {},
+    })
+    monkeypatch.setattr(cli_module, 'collect_provenance', provenance)
+    monkeypatch.setattr(cli_module, 'seed_all', lambda seed: events.append(('seed', seed)))
     monkeypatch.setattr(cli_module.AutoImageProcessor, 'from_pretrained', Mock())
-    monkeypatch.setattr(cli_module, 'ViTLoRAFrameEncoder', Mock(side_effect=lambda _: nn.Identity()))
+    monkeypatch.setattr(
+        cli_module, 'ViTLoRAFrameEncoder',
+        Mock(side_effect=lambda _: events.append(('model', None)) or nn.Identity()),
+    )
     monkeypatch.setattr(cli_module, 'ViTLoRAMoCo', Mock(return_value=nn.Linear(1, 1)))
     run = Mock(return_value={'status': 'paused'})
     monkeypatch.setattr(cli_module.full, 'run_full_streaming_moco', run)
 
     def invoke(*options):
-        monkeypatch.setattr('sys.argv', ['cli', '/anet', '--device', 'cpu', '--disable-comet',
+        monkeypatch.setattr('sys.argv', ['cli', '/anet', '--seed', '7', '--device', 'cpu', '--disable-comet',
                                          '--output-root', str(tmp_path), *options])
         cli_module.main()
-    return dict(invoke=invoke, run=run, adapter=adapter, sources=sources, root=tmp_path)
+    return dict(invoke=invoke, run=run, adapter=adapter, sources=sources, root=tmp_path,
+                events=events, provenance=provenance)
 
 
 def test_fresh_run_uses_all_training_sources_in_adapter_order(cli, capsys):
@@ -43,6 +52,9 @@ def test_fresh_run_uses_all_training_sources_in_adapter_order(cli, capsys):
     assert config['protocol'] == {'stream_mode': 'strict_single', 'key_transform': 'gbr_horizontal_flip',
                                   'negative_policy': 'all_past'}
     assert config['intervals'] == {'resume_videos': 100, 'snapshot_videos': 1000, 'comet_metric_updates': 100}
+    assert config['seed'] == 7 and config['device_identity'] == {'type': 'cpu'}
+    assert cli['events'].index(('seed', 7)) < cli['events'].index(('model', None))
+    cli['provenance'].assert_called_once_with(require_clean=True)
 
 
 def test_resume_is_explicit_and_reads_saved_experiment(cli):
@@ -53,7 +65,9 @@ def test_resume_is_explicit_and_reads_saved_experiment(cli):
     assert 'resumes' in json.loads((cli['root'] / 'run1' / 'run_metadata.json').read_text())
 
 
-@pytest.mark.parametrize('options', [('--run-id', '../x'), ('--run-id', 'a', '--stop-after-videos', '0')])
+@pytest.mark.parametrize('options', [
+    ('--run-id', '../x'), ('--run-id', 'a', '--stop-after-videos', '0'), ('--run-id', 'a', '--seed', '-1'),
+])
 def test_invalid_options_stop_before_work(cli, options):
     with pytest.raises(SystemExit):
         cli['invoke'](*options)

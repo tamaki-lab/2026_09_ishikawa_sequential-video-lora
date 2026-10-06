@@ -20,25 +20,39 @@ import torch
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
 from safetensors.torch import load_file
 
-from self_supervised.moco.vit_lora_moco import lora_parameters
+from self_supervised.moco.vit_lora_moco import MOMENTUM, QUEUE_CAPACITY, TEMPERATURE, lora_parameters
+from training.moco_protocol import STAGE6B_PROTOCOL
 from utils.artifact_io import canonical_json_bytes, read_json, sha256_bytes, sha256_file, write_bytes_atomic
 from utils.artifact_io import fsync_directory, write_json_atomic
+from utils.provenance import CHECKPOINT_ID, LOADER_BRANCH, LOADER_COMMIT, REPOSITORY
 
 
-RESUME_SCHEMA = 'streaming-moco-resume/v1'
-SNAPSHOT_SCHEMA = 'activitynet-moco-query-lora-snapshot/v1'
-PROTOCOL_VERSION = 'activitynet-full-single-pass-streaming-moco/v1'
+RESUME_SCHEMA = 'streaming-moco-resume/v2'
+SNAPSHOT_SCHEMA = 'activitynet-moco-query-lora-snapshot/v2'
+PROTOCOL_VERSION = 'activitynet-full-single-pass-streaming-moco/v2'
 SNAPSHOT_FILES = ('adapter_model.safetensors', 'adapter_config.json')
 # Fields that must match exactly between a checkpoint and the resuming process.
 RESUME_IDENTITY = (
-    'run_id', 'protocol_version', 'protocol', 'repository', 'commit', 'dependencies', 'base_model', 'base_fingerprints',
-    'lora_config', 'queue_capacity', 'momentum', 'temperature', 'optimizer_config',
+    'run_id', 'protocol_version', 'protocol', 'repository', 'branch', 'commit', 'dirty', 'tracked_diff_sha256',
+    'dependencies', 'base_model', 'base_fingerprints', 'lora_config', 'queue_capacity', 'momentum', 'temperature',
+    'optimizer_config', 'seed', 'device_identity',
     'source_count', 'ordered_source_sha256',
 )
 
 
 def ordered_source_sha256(source_ids):
     return sha256_bytes(canonical_json_bytes(list(source_ids)))
+
+
+def seed_all(seed):
+    """Seed every RNG owned by the production process before model creation."""
+    if type(seed) is not int or not 0 <= seed < 2 ** 32:
+        raise ValueError('seed must be an integer in [0, 2**32)')
+    random.seed(seed)
+    numpy.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def base_fingerprint(encoder):
@@ -52,6 +66,90 @@ def base_fingerprint(encoder):
         digest.update(str(tuple(tensor.shape)).encode() + str(tensor.dtype).encode())
         digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
+
+
+def encoder_base_fingerprint(encoder):
+    """Wrapper-independent SHA-256 of the frozen base ViT tensors.
+
+    PEFT replaces Q/V modules with LoRA wrappers. Removing LoRA tensors and
+    normalizing ``.base_layer.`` makes the same pretrained ViT hash equally
+    for the plain and PEFT-wrapped encoders used by the two probe conditions.
+    """
+    model = encoder.vit.get_base_model() if hasattr(encoder.vit, 'get_base_model') else encoder.vit
+    tensors = {}
+    for name, tensor in model.state_dict().items():
+        if '.lora_' in name:
+            continue
+        normalized = name.replace('.base_layer.', '.')
+        if normalized in tensors:
+            raise RuntimeError(f'Duplicate normalized base tensor name: {normalized}')
+        tensors[normalized] = tensor
+    digest = hashlib.sha256()
+    for name, tensor in sorted(tensors.items()):
+        digest.update(name.encode())
+        digest.update(str(tuple(tensor.shape)).encode() + str(tensor.dtype).encode())
+        digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def validate_production_snapshot_metadata(
+    metadata, *, expected_source_sha256, expected_dataset_root, expected_base_fingerprint,
+    expected_source_count=10_024,
+):
+    """Reject a snapshot that is not the unique final Stage 6B production artifact."""
+    dataset = metadata.get('dataset') or {}
+    implementation = metadata.get('implementation') or {}
+    loader = metadata.get('sequential_loader') or {}
+    optimizer = metadata.get('optimizer_config') or {}
+    expected_protocol = {
+        'stream_mode': STAGE6B_PROTOCOL.stream_mode,
+        'key_transform': STAGE6B_PROTOCOL.key_transform,
+        'negative_policy': STAGE6B_PROTOCOL.negative_policy,
+    }
+    expected_lora = {
+        'target_modules': ['q_proj', 'v_proj'], 'r': 8, 'lora_alpha': 8,
+        'lora_dropout': 0.0, 'bias': 'none',
+    }
+    versions = metadata.get('versions') or {}
+    required_versions = {'python', 'numpy', 'torch', 'transformers', 'peft', 'sequential_loader'}
+    checks = {
+        'schema': metadata.get('schema') == SNAPSHOT_SCHEMA,
+        'protocol_version': metadata.get('protocol_version') == PROTOCOL_VERSION,
+        'final': metadata.get('final') is True,
+        'processed_videos': metadata.get('processed_videos') == expected_source_count,
+        'global_update_step': type(metadata.get('global_update_step')) is int
+        and metadata['global_update_step'] > 0,
+        'dataset_name': dataset.get('name') == 'ActivityNet',
+        'dataset_version': dataset.get('version') == '1.3',
+        'dataset_split': dataset.get('split') == 'training',
+        'dataset_root': dataset.get('root') == str(Path(expected_dataset_root).resolve()),
+        'source_count': dataset.get('source_count') == expected_source_count,
+        'ordered_source_sha256': dataset.get('ordered_source_sha256') == expected_source_sha256,
+        'protocol': metadata.get('protocol') == expected_protocol,
+        'base_model': metadata.get('base_model') == CHECKPOINT_ID,
+        'base_fingerprint': metadata.get('base_fingerprint') == expected_base_fingerprint,
+        'repository': implementation.get('repository') == REPOSITORY,
+        'clean_implementation': implementation.get('dirty') is False,
+        'implementation_commit': isinstance(implementation.get('commit'), str)
+        and len(implementation['commit']) == 40,
+        'tracked_diff_sha256': isinstance(implementation.get('tracked_diff_sha256'), str)
+        and len(implementation['tracked_diff_sha256']) == 64,
+        'sequential_loader': (loader.get('branch'), loader.get('commit'), loader.get('dirty'))
+        == (LOADER_BRANCH, LOADER_COMMIT, False),
+        'versions': required_versions <= set(versions),
+        'seed': type(metadata.get('seed')) is int and 0 <= metadata['seed'] < 2 ** 32,
+        'device_identity': isinstance(metadata.get('device_identity'), dict)
+        and metadata['device_identity'].get('type') in ('cpu', 'cuda'),
+        'queue_capacity': metadata.get('queue_capacity') == QUEUE_CAPACITY,
+        'momentum': metadata.get('momentum') == MOMENTUM,
+        'temperature': metadata.get('temperature') == TEMPERATURE,
+        'lora_config': metadata.get('lora_config') == expected_lora,
+        'optimizer': (optimizer.get('class'), optimizer.get('lr'), optimizer.get('weight_decay'))
+        == ('AdamW', 1.0e-3, 0.0),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise RuntimeError(f'Production Query LoRA snapshot contract mismatch: {failed}')
 
 
 def lora_config(encoder):

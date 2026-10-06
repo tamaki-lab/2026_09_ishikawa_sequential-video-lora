@@ -16,10 +16,13 @@ import training.streaming_moco_full as full
 
 
 PROVENANCE = {
-    'implementation': {'repository': 'repo', 'branch': 'dev', 'commit': 'abc', 'dirty': False},
-    'sequential_loader': {'branch': 'ActivityNet', 'commit': 'def'}, 'base_model': 'base',
+    'implementation': {'repository': 'repo', 'branch': 'dev', 'commit': 'abc', 'dirty': False,
+                       'tracked_diff_sha256': 'clean'},
+    'sequential_loader': {'branch': 'ActivityNet', 'commit': 'def'},
+    'versions': {'python': 'test'}, 'base_model': 'base',
 }
-CONFIG = {'dataset': {'name': 'synthetic', 'split': 'training'}}
+CONFIG = {'dataset': {'name': 'synthetic', 'split': 'training'}, 'seed': 0,
+          'device_identity': {'type': 'cpu'}}
 
 
 def make_sources(lengths):
@@ -70,7 +73,7 @@ def small(monkeypatch):
         for a, b in zip(model.query_encoder.parameters(), model.key_encoder.parameters()):
             assert torch.equal(a, b) and a.data_ptr() != b.data_ptr()
 
-    snapshots = []
+    snapshots, snapshot_metadata = [], []
 
     def snapshot(root, encoder, metadata):
         name = checkpoint.snapshot_name(metadata['processed_videos'], metadata['global_update_step'],
@@ -79,11 +82,13 @@ def small(monkeypatch):
         target.mkdir(parents=True)
         lora = {k: v.clone() for k, v in checkpoint.lora_parameters(encoder).items()}
         snapshots.append((name, lora))
+        snapshot_metadata.append(metadata)
         (target / 'metadata.json').write_text(json.dumps(metadata))
         return target, {**metadata, 'files': {f: 'x' for f in checkpoint.SNAPSHOT_FILES}}
 
     monkeypatch.setattr(full, 'audit_initial_state', initial)
     monkeypatch.setattr(full, 'audit_parameters', lambda model: None)
+    monkeypatch.setattr(full, 'encoder_base_fingerprint', lambda encoder: 'base-fingerprint')
     monkeypatch.setattr(full, 'lora_config', lambda encoder: {'r': 8})
     monkeypatch.setattr(full, 'write_evaluation_snapshot', snapshot)
     monkeypatch.setattr(full, 'log_artifact', lambda *args, **kwargs: {'status': 'disabled'})
@@ -92,6 +97,7 @@ def small(monkeypatch):
         torch.manual_seed(seed)
         return ViTLoRAMoCo(SmallEncoder()).train()
     build.snapshots = snapshots
+    build.snapshot_metadata = snapshot_metadata
     return build
 
 
@@ -149,6 +155,9 @@ def test_resume_and_snapshot_triggers(small, videos, tmp_path):
     assert snapshots == [(3, False), (6, False), (7, True)]
     assert [name for name, _ in small.snapshots] == [
         'videos-000003_step-5', 'videos-000006_step-11', 'videos-000007_step-13_final']
+    final_metadata = small.snapshot_metadata[-1]
+    assert final_metadata['seed'] == 0 and final_metadata['device_identity'] == {'type': 'cpu'}
+    assert final_metadata['base_fingerprint'] and final_metadata['versions'] == {'python': 'test'}
     latest = checkpoint.load_resume_checkpoint(tmp_path / 'run' / 'resume' / 'latest.pt')
     assert latest['counters'] == {'processed_videos': 7, 'next_video_index': 7, 'global_update_step': 13,
                                   'next_source_id': None, 'final': True}
@@ -216,6 +225,16 @@ def test_resume_rejects_mismatch_corruption_mid_video_and_final(small, videos, t
         run(small(), sources[::-1], tmp_path / 'run', resume=True)
     with pytest.raises(RuntimeError, match='does not match'):
         run(small(), sources, tmp_path / 'run', resume=True, run_id='other')
+    with pytest.raises(RuntimeError, match='does not match'):
+        run(small(), sources, tmp_path / 'run', resume=True,
+            run_config={**CONFIG, 'seed': 1})
+    changed = {**PROVENANCE, 'implementation': {**PROVENANCE['implementation'],
+                                                'tracked_diff_sha256': 'changed'}}
+    with pytest.raises(RuntimeError, match='does not match'):
+        run(small(), sources, tmp_path / 'run', resume=True, provenance=changed)
+    with pytest.raises(RuntimeError, match='device identity'):
+        run(small(), sources, tmp_path / 'run', resume=True,
+            run_config={**CONFIG, 'device_identity': {'type': 'cuda'}})
 
     latest = tmp_path / 'run' / 'resume' / 'latest.pt'
     original = latest.read_bytes()
@@ -233,6 +252,15 @@ def test_resume_rejects_mismatch_corruption_mid_video_and_final(small, videos, t
     assert run(small(), sources, tmp_path / 'run', resume=True)['final']
     with pytest.raises(RuntimeError, match='already completed'):
         run(small(), sources, tmp_path / 'run', resume=True)
+
+
+def test_dirty_full_run_is_rejected_before_creating_output(small, videos, tmp_path):
+    videos['lengths'] = {'a': 2}
+    dirty = {**PROVENANCE, 'implementation': {**PROVENANCE['implementation'], 'dirty': True}}
+    target = tmp_path / 'run'
+    with pytest.raises(RuntimeError, match='clean implementation'):
+        run(small(), make_sources(videos['lengths']), target, provenance=dirty)
+    assert not target.exists()
 
 
 def test_decode_failure_stops_and_keeps_last_boundary_checkpoint(small, videos, tmp_path):
