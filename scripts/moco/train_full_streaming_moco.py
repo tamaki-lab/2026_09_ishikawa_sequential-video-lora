@@ -1,21 +1,21 @@
 """Full-dataset single-pass Stage 6B Streaming MoCo on ActivityNet training.
 
 Fresh run (the run directory must not exist):
-    python -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <id> --seed <seed> --device cuda
+    python -m scripts.moco.train_full_streaming_moco runtime.dataset_root=/path/to/ActivityNet \
+        runtime.run_id=<id> runtime.seed=<seed> runtime.device=cuda
 
 Resume from log/moco/<id>/resume/latest.pt at the saved video boundary:
-    python -m scripts.moco.train_full_streaming_moco /path/to/ActivityNet --run-id <id> --seed <same-seed> \
-        --device cuda --resume
+    python -m scripts.moco.train_full_streaming_moco runtime.dataset_root=/path/to/ActivityNet \
+        runtime.run_id=<id> runtime.seed=<same-seed> runtime.device=cuda runtime.resume=true
 
-`--stop-after-videos N` pauses at the N-th completed video boundary (writes
+`runtime.stop_after_videos=N` pauses at the N-th completed video boundary (writes
 latest.pt, no final snapshot); intended for short smoke and resume checks.
 """
 
-import argparse
 import json
-import re
-from pathlib import Path
 
+import hydra
+from omegaconf import DictConfig, OmegaConf
 import sequential_loader as sl
 import torch
 from transformers import AutoImageProcessor
@@ -23,86 +23,103 @@ from transformers import AutoImageProcessor
 from logger.comet_lineage import end_experiment, start_experiment
 from model.backbones.vit import ViTLoRAFrameEncoder
 from self_supervised.moco import ViTLoRAMoCo
-from training.moco_checkpoint import PROTOCOL_VERSION, seed_all
-from training.moco_protocol import STAGE6B_PROTOCOL
+from training.moco_checkpoint import seed_all
+from training.moco_config import FullMoCoConfig
 from training import streaming_moco_full as full
 from utils.artifact_io import read_json, write_json_atomic
-from utils.provenance import CHECKPOINT_ID, collect_provenance, device_identity
+from utils.configuration import plain_config
+from utils.provenance import collect_provenance, device_identity
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('dataset_root', type=Path)
-    parser.add_argument('--run-id', required=True)
-    parser.add_argument('--seed', required=True, type=int)
-    parser.add_argument('--resume', action='store_true', help='Continue from resume/latest.pt only')
-    parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
-    parser.add_argument('--stop-after-videos', type=int)
-    parser.add_argument('--output-root', type=Path, default=Path('log/moco'))
-    parser.add_argument('--disable-comet', action='store_true')
-    args = parser.parse_args()
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', args.run_id):
-        parser.error('--run-id may contain only letters, digits, ".", "_" and "-"')
-    if args.stop_after_videos is not None and args.stop_after_videos < 1:
-        parser.error('--stop-after-videos must be positive')
-    if not 0 <= args.seed < 2 ** 32:
-        parser.error('--seed must be in [0, 2**32)')
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        parser.error('CUDA is not available')
+def run(cfg):
+    resolved = plain_config(cfg)
+    settings = FullMoCoConfig.from_mapping(resolved)
+    runtime = settings.runtime
+    if runtime.device == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA is not available')
 
-    seed_all(args.seed)
-    provenance = {**collect_provenance(require_clean=True), 'base_model': CHECKPOINT_ID}
-    device = torch.device(args.device)
+    production_config = settings.production_groups_match()
+    seed_all(runtime.seed)
+    provenance = {
+        **collect_provenance(policy=settings.provenance, require_clean=production_config),
+        'base_model': settings.encoder.checkpoint_id,
+    }
+    device = torch.device(runtime.device)
     runtime_device = device_identity(device)
-    dataset_root = args.dataset_root.resolve()
-    run_dir = args.output_root / args.run_id
-    config = {
-        'run_id': args.run_id, 'protocol_version': PROTOCOL_VERSION, 'resume': args.resume, 'seed': args.seed,
-        'dataset': {'name': 'ActivityNet', 'version': '1.3', 'split': 'training',
-                    'root': str(dataset_root)},
-        'protocol': {'stream_mode': STAGE6B_PROTOCOL.stream_mode, 'key_transform': STAGE6B_PROTOCOL.key_transform,
-                     'negative_policy': STAGE6B_PROTOCOL.negative_policy},
-        'optimizer': {'class': 'AdamW', 'lr': full.LEARNING_RATE, 'weight_decay': full.WEIGHT_DECAY},
-        'intervals': {'resume_videos': full.RESUME_INTERVAL, 'snapshot_videos': full.SNAPSHOT_INTERVAL,
-                      'comet_metric_updates': full.METRIC_INTERVAL},
-        'expected_source_count': full.ACTIVITYNET_TRAINING_COUNT,
-        'stop_after_videos': args.stop_after_videos,
+    dataset_root = runtime.dataset_root.resolve()
+    run_dir = runtime.output_root / runtime.run_id
+    protocol = settings.moco.protocol
+    run_config = {
+        'run_id': runtime.run_id, 'protocol_version': settings.moco.protocol_version,
+        'resume': runtime.resume, 'seed': runtime.seed,
+        'dataset': {'name': settings.activitynet.name, 'version': settings.activitynet.version,
+                    'split': settings.activitynet.splits['training']},
+        'protocol': {'stream_mode': protocol.stream_mode, 'key_transform': protocol.key_transform,
+                     'negative_policy': protocol.negative_policy},
+        'optimizer': {'class': settings.moco.optimizer.name, 'lr': settings.moco.optimizer.lr,
+                      'weight_decay': settings.moco.optimizer.weight_decay,
+                      'betas': list(settings.moco.optimizer.betas), 'eps': settings.moco.optimizer.eps},
+        'intervals': {'resume_videos': settings.moco.intervals.resume_videos,
+                      'snapshot_videos': settings.moco.intervals.snapshot_videos,
+                      'comet_metric_updates': settings.moco.intervals.comet_metric_updates},
+        'expected_source_count': settings.activitynet.expected_source_counts['training'],
+        'frames_per_chunk': settings.sequential.frames_per_chunk,
+        'round_robin_stream_count': settings.sequential.round_robin_stream_count,
+        'production_config': production_config,
+        'stop_after_videos': runtime.stop_after_videos,
         'device': str(device),
         'device_name': torch.cuda.get_device_name(device) if device.type == 'cuda' else 'cpu',
         'device_identity': runtime_device,
-        'run_dir': str(run_dir),
+        'locations': {'dataset_root': str(dataset_root), 'run_dir': str(run_dir.resolve())},
     }
-    print('Resolved config: ' + json.dumps(config, sort_keys=True), flush=True)
+    print('Resolved Hydra config:\n' + OmegaConf.to_yaml(cfg, resolve=True), flush=True)
+    print('Resolved run config: ' + json.dumps(run_config, sort_keys=True), flush=True)
     print('Provenance: ' + json.dumps(provenance, sort_keys=True), flush=True)
 
-    sources = sl.ActivityNetAdapter(dataset_root=dataset_root).sequence_sources('training')
-    full.validate_full_sources(sources, full.ACTIVITYNET_TRAINING_COUNT)
+    split = settings.activitynet.splits['training']
+    sources = sl.ActivityNetAdapter(dataset_root=dataset_root).sequence_sources(split)
+    full.validate_full_sources(sources, settings.activitynet.expected_source_counts['training'])
     existing_key = None
-    if args.resume:
+    if runtime.resume:
         existing_key = read_json(run_dir / 'run_metadata.json').get('moco_experiment_key')
     experiment, comet = start_experiment(
-        f'moco-full__{args.run_id}', {'config': config, 'provenance': provenance}, tags=('moco', 'full-dataset'),
-        disabled=args.disable_comet, existing_key=existing_key,
+        f'moco-full__{runtime.run_id}', {'config': run_config, 'provenance': provenance},
+        tags=('moco', 'full-dataset'), disabled=settings.disable_comet, existing_key=existing_key,
+        project_name=settings.tracking['comet_project'],
     )
     print(f'Comet: {json.dumps(comet)}', flush=True)
 
-    processor = AutoImageProcessor.from_pretrained(CHECKPOINT_ID)
-    moco = ViTLoRAMoCo(ViTLoRAFrameEncoder(CHECKPOINT_ID)).to(device).train()
+    processor = AutoImageProcessor.from_pretrained(settings.encoder.checkpoint_id)
+    encoder = ViTLoRAFrameEncoder(
+        settings.encoder.checkpoint_id, feature_size=settings.encoder.feature_size,
+        image_size=settings.encoder.image_size, channels=settings.encoder.channels,
+        lora_config=settings.encoder.lora,
+    )
+    moco = ViTLoRAMoCo(encoder, config=settings.moco).to(device).train()
     try:
         result = full.run_full_streaming_moco(
-            moco, processor, sources, device, run_dir, run_id=args.run_id, provenance=provenance,
-            run_config=config, resume=args.resume, stop_after_videos=args.stop_after_videos, experiment=experiment,
+            moco, processor, sources, device, run_dir, run_id=runtime.run_id, provenance=provenance,
+            run_config=run_config, resume=runtime.resume, stop_after_videos=runtime.stop_after_videos,
+            experiment=experiment, config=settings,
         )
     finally:
         error = end_experiment(experiment)
         if error:
             print(f'Comet end failed: {error}', flush=True)
-    if args.resume:
+    if runtime.resume:
         metadata = read_json(run_dir / 'run_metadata.json')
-        metadata.setdefault('resumes', []).append({'config': config, 'provenance': provenance, 'result': result})
+        metadata.setdefault('resumes', []).append({
+            'config': run_config, 'provenance': provenance, 'result': result,
+        })
         write_json_atomic(run_dir / 'run_metadata.json', metadata)
     print(f'Run directory: {run_dir}', flush=True)
     print('Result: ' + json.dumps(result, sort_keys=True), flush=True)
+    return result
+
+
+@hydra.main(version_base='1.3', config_path='../../conf', config_name='moco_full')
+def main(cfg: DictConfig):
+    run(cfg)
 
 
 if __name__ == '__main__':

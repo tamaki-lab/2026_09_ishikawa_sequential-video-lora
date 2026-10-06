@@ -8,7 +8,7 @@ import json
 
 import torch
 
-from self_supervised.moco.vit_lora_moco import PROJECTION_SIZE, require_normalized
+from self_supervised.moco.vit_lora_moco import require_normalized
 from self_supervised.moco.negative_selection import select_negatives
 from integration.sequential_moco import make_two_views, encode_query_view, encode_key_view
 from training.moco_audit import audit_views
@@ -52,8 +52,8 @@ def audit_queue(moco, expected):
         raise RuntimeError('Queue key / metadata alignment changed')
     # One batched check per call; same per-key contract as require_normalized.
     keys = torch.stack([entry.key for entry in entries])
-    if tuple(keys.shape[1:]) != (PROJECTION_SIZE,) or not torch.isfinite(keys).all().item():
-        raise RuntimeError('Expected a finite projected vector [128]')
+    if tuple(keys.shape[1:]) != (moco.projection_size,) or not torch.isfinite(keys).all().item():
+        raise RuntimeError(f'Expected a finite projected vector [{moco.projection_size}]')
     norms = keys.norm(dim=1)
     if not torch.allclose(norms, torch.ones_like(norms), rtol=1e-5, atol=1e-6):
         raise RuntimeError('Expected an L2-normalized projected vector')
@@ -62,7 +62,7 @@ def audit_queue(moco, expected):
 
 
 def enqueue_key(moco, key, sample, expected):
-    require_normalized(key)
+    require_normalized(key, moco.projection_size)
     if key.requires_grad or key.grad_fn is not None:
         raise RuntimeError('Current Key must be detached')
     # Independent reference checks FIFO history, metadata and the pre-EMA key.
@@ -96,7 +96,7 @@ def train_step(moco, processor, sample, device, optimizer, groups, before, expec
     optimizer.zero_grad(set_to_none=True)
     query = encode_query_view(query_view, processor, moco, device)[-1]
     key = encode_key_view(key_view, processor, moco, device)[-1]
-    require_normalized(key)
+    require_normalized(key, moco.projection_size)
     if key.requires_grad:
         raise RuntimeError('Current Key must be detached')
     audit_queue(moco, expected_queue)

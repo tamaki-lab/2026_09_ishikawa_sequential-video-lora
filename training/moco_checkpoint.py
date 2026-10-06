@@ -20,21 +20,28 @@ import torch
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
 from safetensors.torch import load_file
 
-from self_supervised.moco.vit_lora_moco import MOMENTUM, QUEUE_CAPACITY, TEMPERATURE, lora_parameters
-from training.moco_protocol import STAGE6B_PROTOCOL
+from self_supervised.moco.vit_lora_moco import lora_parameters
+from training.moco_config import (
+    canonical_activitynet_config, canonical_encoder_config, canonical_moco_config, canonical_sequential_config,
+)
 from utils.artifact_io import canonical_json_bytes, read_json, sha256_bytes, sha256_file, write_bytes_atomic
 from utils.artifact_io import fsync_directory, write_json_atomic
-from utils.provenance import CHECKPOINT_ID, LOADER_BRANCH, LOADER_COMMIT, REPOSITORY
+from utils.provenance import LOADER_BRANCH, LOADER_COMMIT, REPOSITORY
 
 
 RESUME_SCHEMA = 'streaming-moco-resume/v2'
 SNAPSHOT_SCHEMA = 'activitynet-moco-query-lora-snapshot/v2'
-PROTOCOL_VERSION = 'activitynet-full-single-pass-streaming-moco/v2'
+_ACTIVITYNET_CONFIG = canonical_activitynet_config()
+_ENCODER_CONFIG = canonical_encoder_config()
+_MOCO_CONFIG = canonical_moco_config()
+_SEQUENTIAL_CONFIG = canonical_sequential_config()
+PROTOCOL_VERSION = _MOCO_CONFIG.protocol_version
 SNAPSHOT_FILES = ('adapter_model.safetensors', 'adapter_config.json')
 # Fields that must match exactly between a checkpoint and the resuming process.
 RESUME_IDENTITY = (
     'run_id', 'protocol_version', 'protocol', 'repository', 'branch', 'commit', 'dirty', 'tracked_diff_sha256',
-    'dependencies', 'base_model', 'base_fingerprints', 'lora_config', 'queue_capacity', 'momentum', 'temperature',
+    'dependencies', 'dataset', 'stream_config', 'base_model', 'base_fingerprints', 'lora_config',
+    'feature_size', 'projection_size', 'queue_capacity', 'momentum', 'temperature',
     'optimizer_config', 'seed', 'device_identity',
     'source_count', 'ordered_source_sha256',
 )
@@ -93,40 +100,46 @@ def encoder_base_fingerprint(encoder):
 
 
 def validate_production_snapshot_metadata(
-    metadata, *, expected_source_sha256, expected_dataset_root, expected_base_fingerprint,
-    expected_source_count=10_024,
+    metadata, *, expected_source_sha256, expected_base_fingerprint, expected_dataset_root=None,
+    expected_source_count=None,
 ):
-    """Reject a snapshot that is not the unique final Stage 6B production artifact."""
+    """Reject a snapshot that is not the unique final Stage 6B production artifact.
+
+    ``expected_dataset_root`` is retained for caller compatibility but is not
+    an identity check: a byte-identical dataset may be mounted elsewhere.
+    """
+    if expected_source_count is None:
+        expected_source_count = _ACTIVITYNET_CONFIG.expected_source_counts['training']
     dataset = metadata.get('dataset') or {}
     implementation = metadata.get('implementation') or {}
     loader = metadata.get('sequential_loader') or {}
     optimizer = metadata.get('optimizer_config') or {}
     expected_protocol = {
-        'stream_mode': STAGE6B_PROTOCOL.stream_mode,
-        'key_transform': STAGE6B_PROTOCOL.key_transform,
-        'negative_policy': STAGE6B_PROTOCOL.negative_policy,
+        'stream_mode': _MOCO_CONFIG.protocol.stream_mode,
+        'key_transform': _MOCO_CONFIG.protocol.key_transform,
+        'negative_policy': _MOCO_CONFIG.protocol.negative_policy,
     }
-    expected_lora = {
-        'target_modules': ['q_proj', 'v_proj'], 'r': 8, 'lora_alpha': 8,
-        'lora_dropout': 0.0, 'bias': 'none',
-    }
+    expected_lora = _ENCODER_CONFIG.lora.metadata()
     versions = metadata.get('versions') or {}
     required_versions = {'python', 'numpy', 'torch', 'transformers', 'peft', 'sequential_loader'}
     checks = {
         'schema': metadata.get('schema') == SNAPSHOT_SCHEMA,
+        # Older canonical v2 snapshots predate this explicit marker.  New
+        # non-canonical Hydra overrides record False and must never pass the
+        # production gate.
+        'production_config': metadata.get('production_config', True) is True,
         'protocol_version': metadata.get('protocol_version') == PROTOCOL_VERSION,
         'final': metadata.get('final') is True,
         'processed_videos': metadata.get('processed_videos') == expected_source_count,
         'global_update_step': type(metadata.get('global_update_step')) is int
         and metadata['global_update_step'] > 0,
-        'dataset_name': dataset.get('name') == 'ActivityNet',
-        'dataset_version': dataset.get('version') == '1.3',
-        'dataset_split': dataset.get('split') == 'training',
-        'dataset_root': dataset.get('root') == str(Path(expected_dataset_root).resolve()),
+        'dataset_name': dataset.get('name') == _ACTIVITYNET_CONFIG.name,
+        'dataset_version': dataset.get('version') == _ACTIVITYNET_CONFIG.version,
+        'dataset_split': dataset.get('split') == _ACTIVITYNET_CONFIG.splits['training'],
         'source_count': dataset.get('source_count') == expected_source_count,
         'ordered_source_sha256': dataset.get('ordered_source_sha256') == expected_source_sha256,
         'protocol': metadata.get('protocol') == expected_protocol,
-        'base_model': metadata.get('base_model') == CHECKPOINT_ID,
+        'base_model': metadata.get('base_model') == _ENCODER_CONFIG.checkpoint_id,
         'base_fingerprint': metadata.get('base_fingerprint') == expected_base_fingerprint,
         'repository': implementation.get('repository') == REPOSITORY,
         'clean_implementation': implementation.get('dirty') is False,
@@ -140,12 +153,27 @@ def validate_production_snapshot_metadata(
         'seed': type(metadata.get('seed')) is int and 0 <= metadata['seed'] < 2 ** 32,
         'device_identity': isinstance(metadata.get('device_identity'), dict)
         and metadata['device_identity'].get('type') in ('cpu', 'cuda'),
-        'queue_capacity': metadata.get('queue_capacity') == QUEUE_CAPACITY,
-        'momentum': metadata.get('momentum') == MOMENTUM,
-        'temperature': metadata.get('temperature') == TEMPERATURE,
+        # Legacy canonical v2 snapshots predate these explicit fields. New
+        # snapshots always record them, while an explicit noncanonical value
+        # must fail the production gate.
+        'feature_size': metadata.get('feature_size', _ENCODER_CONFIG.feature_size) == _ENCODER_CONFIG.feature_size,
+        'projection_size': metadata.get(
+            'projection_size', _MOCO_CONFIG.projection_size,
+        ) == _MOCO_CONFIG.projection_size,
+        'frames_per_chunk': metadata.get(
+            'frames_per_chunk', _SEQUENTIAL_CONFIG.frames_per_chunk,
+        ) == _SEQUENTIAL_CONFIG.frames_per_chunk,
+        'queue_capacity': metadata.get('queue_capacity') == _MOCO_CONFIG.queue_capacity,
+        'momentum': metadata.get('momentum') == _MOCO_CONFIG.momentum,
+        'temperature': metadata.get('temperature') == _MOCO_CONFIG.temperature,
         'lora_config': metadata.get('lora_config') == expected_lora,
-        'optimizer': (optimizer.get('class'), optimizer.get('lr'), optimizer.get('weight_decay'))
-        == ('AdamW', 1.0e-3, 0.0),
+        'optimizer': (
+            optimizer.get('class'), optimizer.get('lr'), optimizer.get('weight_decay'), optimizer.get('betas'),
+            optimizer.get('eps'),
+        ) == (
+            _MOCO_CONFIG.optimizer.name, _MOCO_CONFIG.optimizer.lr, _MOCO_CONFIG.optimizer.weight_decay,
+            list(_MOCO_CONFIG.optimizer.betas), _MOCO_CONFIG.optimizer.eps,
+        ),
     }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
@@ -218,7 +246,9 @@ def training_state(moco, optimizer):
         'optimizer': optimizer.state_dict(),
         'queue': {
             'capacity': moco.queue.capacity,
-            'keys': torch.stack([entry.key for entry in entries]) if entries else torch.empty(0, 128),
+            'keys': torch.stack([entry.key for entry in entries]) if entries else torch.empty(
+                0, moco.projection_size
+            ),
             'sequence_ids': [entry.sequence_id for entry in entries],
             'sequence_indices': [entry.sequence_index for entry in entries],
         },
@@ -342,7 +372,9 @@ def write_evaluation_snapshot(snapshot_root, encoder, metadata):
     metadata = {
         'schema': SNAPSHOT_SCHEMA, **metadata,
         'files': {file: sha256_file(temporary / file) for file in SNAPSHOT_FILES},
-        'local_path': str(target),
+        # Placement is useful provenance, but is intentionally outside every
+        # snapshot identity comparison so an artifact remains portable.
+        'locations': {'artifact': str(target.resolve())},
     }
     write_json_atomic(temporary / 'metadata.json', metadata)
     temporary.rename(target)

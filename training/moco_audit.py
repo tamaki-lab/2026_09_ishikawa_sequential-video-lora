@@ -8,17 +8,22 @@ from self_supervised.moco.vit_lora_moco import lora_parameters
 
 def audit_encoder_parameters(encoder):
     """Require exactly the approved Q/V adapters before creating an optimizer."""
+    config = encoder.vit.peft_config['default']
+    target_modules = set(config.target_modules)
+    layer_count = getattr(encoder.vit.get_base_model().config, 'num_hidden_layers', None)
+    if type(layer_count) is not int or layer_count <= 0:
+        raise RuntimeError('Encoder must report a positive transformer layer count')
     targets = [name for name, module in encoder.vit.named_modules() if isinstance(module, LoraLayer)]
-    q_count = sum(name.endswith('.q_proj') for name in targets)
-    v_count = sum(name.endswith('.v_proj') for name in targets)
+    target_counts = {target: sum(name.endswith(f'.{target}') for name in targets) for target in target_modules}
     pooler_none = encoder.vit.get_base_model().pooler is None
     print(f"pooler is None: {pooler_none}")
     print(f"LoRA target names: {targets}")
     print(f"LoRA target count: {len(targets)}")
-    print(f"q_proj count: {q_count}")
-    print(f"v_proj count: {v_count}")
-    if not pooler_none or len(targets) != 24 or (q_count, v_count) != (12, 12):
-        raise RuntimeError("Expected no pooler and exactly 12 Q / 12 V LoRA targets")
+    print(f"LoRA target counts: {target_counts}")
+    if not pooler_none or len(targets) != layer_count * len(target_modules) or any(
+        count != layer_count for count in target_counts.values()
+    ):
+        raise RuntimeError('Expected no pooler and one configured LoRA target per transformer layer')
 
     parameters = dict(encoder.named_parameters())
     lora = {name: p for name, p in parameters.items() if '.lora_A.' in name or '.lora_B.' in name}
@@ -30,8 +35,12 @@ def audit_encoder_parameters(encoder):
     print(f"trainable parameters: {count}")
     print(f"trainable tensor count: {len(trainable)}")
     print(f"unexpected trainable names: {unexpected}")
-    if unexpected or set(trainable) != set(lora) or count != 294_912 or len(trainable) != 48:
-        raise RuntimeError("Expected exactly 294,912 trainable parameters in 48 LoRA tensors")
+    expected_tensors = layer_count * len(target_modules) * 2
+    expected_parameters = layer_count * len(target_modules) * 2 * config.r * encoder.feature_size
+    if unexpected or set(trainable) != set(lora) or count != expected_parameters or len(trainable) != expected_tensors:
+        raise RuntimeError(
+            f'Expected exactly {expected_parameters:,} trainable parameters in {expected_tensors} LoRA tensors'
+        )
     return base, lora
 
 
@@ -55,21 +64,39 @@ def audit_parameters(moco):
     for side in ('query', 'key'):
         encoder = getattr(moco, f'{side}_encoder')
         config = encoder.vit.peft_config['default']
-        if config.target_modules != {'q_proj', 'v_proj'} or (
-            config.r, config.lora_alpha, config.lora_dropout, config.bias
-        ) != (8, 8, 0.0, 'none'):
-            raise RuntimeError(f'Unexpected {side} LoRA configuration')
+        query_config = moco.query_encoder.vit.peft_config['default']
+        if (
+            set(config.target_modules), config.r, config.lora_alpha, config.lora_dropout, config.bias
+        ) != (
+            set(query_config.target_modules), query_config.r, query_config.lora_alpha,
+            query_config.lora_dropout, query_config.bias,
+        ):
+            raise RuntimeError(f'{side} LoRA configuration differs from Query')
         projector = getattr(moco, f'{side}_projector')
         if len(projector) != 3 or not isinstance(projector[0], torch.nn.Linear) or not isinstance(
             projector[1], torch.nn.ReLU
         ) or not isinstance(projector[2], torch.nn.Linear):
             raise RuntimeError('Expected Linear / ReLU / Linear projector')
         if (projector[0].in_features, projector[0].out_features,
-            projector[2].in_features, projector[2].out_features) != (768, 768, 768, 128):
-            raise RuntimeError('Expected 768 -> 768 -> 128 projector')
+            projector[2].in_features, projector[2].out_features) != (
+                moco.feature_size, moco.feature_size, moco.feature_size, moco.projection_size,
+        ):
+            raise RuntimeError(
+                f'Expected {moco.feature_size} -> {moco.feature_size} -> {moco.projection_size} projector'
+            )
     groups = parameter_groups(moco)
     for side in ('query', 'key'):
-        for kind, count, tensors in (('LoRA', 294_912, 48), ('Projector', 689_024, 4)):
+        expected_counts = {
+            'LoRA': (
+                sum(p.numel() for p in groups['query LoRA'].values()), len(groups['query LoRA'])
+            ),
+            'Projector': (
+                moco.feature_size * moco.feature_size + moco.feature_size
+                + moco.feature_size * moco.projection_size + moco.projection_size,
+                4,
+            ),
+        }
+        for kind, (count, tensors) in expected_counts.items():
             parameters = groups[f'{side} {kind}']
             actual = sum(p.numel() for p in parameters.values())
             print(f'{side} {kind} params / tensors: {actual} / {len(parameters)}')
@@ -79,8 +106,8 @@ def audit_parameters(moco):
     trainable = {name: p for name, p in moco.named_parameters() if p.requires_grad}
     if set(trainable) != set(expected):
         raise RuntimeError('Only Query LoRA and Query Projector may be trainable')
-    if (moco.momentum, moco.temperature, moco.queue.capacity) != (0.999, 0.07, 4096):
-        raise RuntimeError('Unexpected momentum, temperature or queue capacity')
+    if moco.queue.projection_size != moco.projection_size:
+        raise RuntimeError('Queue projection size differs from the MoCo projector')
     return groups
 
 

@@ -12,6 +12,7 @@ from self_supervised.moco.vit_lora_moco import lora_parameters
 from test_moco_multistep_canary import SmallEncoder
 from test_vit_lora_frame_encoder import encoder  # noqa: F401 - fixture
 import training.moco_checkpoint as checkpoint
+from utils.provenance import CHECKPOINT_ID
 
 
 def key(seed):
@@ -171,16 +172,19 @@ def test_production_snapshot_contract_is_strict(encoder, tmp_path):  # noqa: F81
                     'ordered_source_sha256': 'sources'},
         'protocol': {'stream_mode': 'strict_single', 'key_transform': 'gbr_horizontal_flip',
                      'negative_policy': 'all_past'},
-        'base_model': checkpoint.CHECKPOINT_ID, 'base_fingerprint': fingerprint,
+        'base_model': CHECKPOINT_ID, 'base_fingerprint': fingerprint,
         'implementation': {'repository': checkpoint.REPOSITORY, 'commit': 'a' * 40, 'dirty': False,
                            'tracked_diff_sha256': 'b' * 64},
         'sequential_loader': {'branch': checkpoint.LOADER_BRANCH, 'commit': checkpoint.LOADER_COMMIT,
                               'dirty': False},
         'versions': {name: 'test' for name in (
             'python', 'numpy', 'torch', 'transformers', 'peft', 'sequential_loader')},
-        'seed': 0, 'device_identity': {'type': 'cpu'}, 'queue_capacity': 4096,
+        'seed': 0, 'device_identity': {'type': 'cpu'},
+        'feature_size': 768, 'projection_size': 128, 'frames_per_chunk': 16,
+        'queue_capacity': 4096,
         'momentum': 0.999, 'temperature': 0.07, 'lora_config': checkpoint.lora_config(encoder),
-        'optimizer_config': {'class': 'AdamW', 'lr': 1.0e-3, 'weight_decay': 0.0},
+        'optimizer_config': {'class': 'AdamW', 'lr': 1.0e-3, 'weight_decay': 0.0, 'betas': [0.9, 0.999],
+                             'eps': 1.0e-8},
     }
     options = dict(expected_source_sha256='sources', expected_dataset_root=tmp_path,
                    expected_base_fingerprint=fingerprint)

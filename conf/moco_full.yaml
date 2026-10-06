@@ -1,0 +1,29 @@
+defaults:
+  - activitynet: v1_3
+  - encoder: vit_base_patch16_224
+  - sequential: default
+  - moco: stage6b_v2
+  - provenance: research_v1
+  - tracking: default
+  - _self_
+
+runtime:
+  dataset_root: ???
+  run_id: ???
+  seed: ???
+  resume: false
+  device: cuda
+  stop_after_videos: null
+  output_root: log/moco
+
+logging:
+  disable_comet: false
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: log/hydra/moco/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+  sweep:
+    dir: log/hydra/moco/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+    subdir: ${hydra.job.num}

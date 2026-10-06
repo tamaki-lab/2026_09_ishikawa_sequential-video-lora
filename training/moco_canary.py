@@ -10,6 +10,7 @@ from collections import deque
 import torch
 
 from training.moco_protocol import STAGE6A_PROTOCOL
+from training.moco_config import canonical_moco_config
 from integration.sequential_moco import make_two_views, encode_key_view
 from integration.sequential_stream import (  # noqa: F401 - re-exported for existing callers
     FRAMES_PER_CHUNK, STREAM_COUNT, ordered_samples, validate_sources,
@@ -23,18 +24,24 @@ from training.streaming_moco import (
 )
 
 
-def round_robin_samples(sources):
+def round_robin_samples(sources, *, frames_per_chunk=FRAMES_PER_CHUNK):
     """Historical Stage 6A scheduling entry point."""
-    return ordered_samples(sources, stream_mode='round_robin')
+    return ordered_samples(sources, stream_mode='round_robin', frames_per_chunk=frames_per_chunk)
 
 
-def run_streaming_moco(moco, processor, sources, device, max_steps=10, *, protocol=STAGE6A_PROTOCOL):
+def run_streaming_moco(
+    moco, processor, sources, device, max_steps=10, *, protocol=STAGE6A_PROTOCOL,
+    optimizer_config=None, frames_per_chunk=FRAMES_PER_CHUNK,
+):
     """Start fresh, warm up each active stream, then perform max_steps updates.
 
     EOF before the target raises rather than reporting a successful canary.
     Models, queues and optimizers are never resumed across calls.
     """
-    validate_sources(sources, protocol.stream_mode)
+    optimizer_config = canonical_moco_config().optimizer if optimizer_config is None else optimizer_config
+    validate_sources(
+        sources, protocol.stream_mode, round_robin_stream_count=protocol.round_robin_stream_count,
+    )
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError('max_steps must be a positive integer')
     audit_initial_state(moco)
@@ -47,7 +54,10 @@ def run_streaming_moco(moco, processor, sources, device, max_steps=10, *, protoc
     completed = 0
     last_sample = None
     try:
-        with ordered_samples(sources, protocol.stream_mode) as samples:
+        with ordered_samples(
+            sources, protocol.stream_mode, frames_per_chunk=frames_per_chunk,
+            round_robin_stream_count=protocol.round_robin_stream_count,
+        ) as samples:
             def take_sample():
                 nonlocal last_sample
                 sample = next(samples, None)
@@ -72,13 +82,16 @@ def run_streaming_moco(moco, processor, sources, device, max_steps=10, *, protoc
             ):
                 raise RuntimeError('Warm-up must not change model parameters or create gradients')
             report_json('warmup_complete', queue_count=len(moco.queue))
-            optimizer = torch.optim.AdamW(moco.query_parameters(), lr=1.0e-3, weight_decay=0.0)
+            optimizer = torch.optim.AdamW(
+                moco.query_parameters(), lr=optimizer_config.lr, weight_decay=optimizer_config.weight_decay,
+            )
             optimized = [p for group in optimizer.param_groups for p in group['params']]
             trainable = {**groups['query LoRA'], **groups['query Projector']}
             if len(optimized) != len(trainable) or {id(p) for p in optimized} != {id(p) for p in trainable.values()}:
                 raise RuntimeError('Optimizer must contain exactly Query LoRA + Query Projector')
             report_json('optimizer', parameters=sum(p.numel() for p in optimized), tensors=len(optimized),
-                        matches_query_lora_and_projector=True, lr=1e-3, weight_decay=0.0)
+                        matches_query_lora_and_projector=True, lr=optimizer_config.lr,
+                        weight_decay=optimizer_config.weight_decay)
             for step in range(max_steps):
                 sample = take_sample()
                 train_step(moco, processor, sample, device, optimizer, groups, before, expected_queue, step, protocol)

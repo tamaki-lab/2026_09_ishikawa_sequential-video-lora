@@ -24,20 +24,26 @@ from training.moco_checkpoint import (
     save_resume_checkpoint, snapshot_name, training_state, validate_resume_identity, write_evaluation_snapshot,
 )
 from training.moco_protocol import STAGE6B_PROTOCOL
+from training.moco_config import canonical_activitynet_config, canonical_moco_config, canonical_sequential_config
 from training.streaming_moco import (
     audit_bases, audit_finite, audit_queue, count_changed, enqueue_key, train_step,
 )
 from utils.artifact_io import read_json, write_json_atomic
+from utils.configuration import load_config_group
 from utils.provenance import device_identity, utc_now
 
 
-ACTIVITYNET_TRAINING_COUNT = 10_024
-RESUME_INTERVAL = 100
-SNAPSHOT_INTERVAL = 1_000
-METRIC_INTERVAL = 100
-LEARNING_RATE = 1.0e-3
-WEIGHT_DECAY = 0.0
-SNAPSHOT_ARTIFACT = 'activitynet-moco-query-lora'
+_ACTIVITYNET_CONFIG = canonical_activitynet_config()
+_MOCO_CONFIG = canonical_moco_config()
+_SEQUENTIAL_CONFIG = canonical_sequential_config()
+_TRACKING_CONFIG = load_config_group('tracking', 'default')
+ACTIVITYNET_TRAINING_COUNT = _ACTIVITYNET_CONFIG.expected_source_counts['training']
+RESUME_INTERVAL = _MOCO_CONFIG.intervals.resume_videos
+SNAPSHOT_INTERVAL = _MOCO_CONFIG.intervals.snapshot_videos
+METRIC_INTERVAL = _MOCO_CONFIG.intervals.comet_metric_updates
+LEARNING_RATE = _MOCO_CONFIG.optimizer.lr
+WEIGHT_DECAY = _MOCO_CONFIG.optimizer.weight_decay
+SNAPSHOT_ARTIFACT = _TRACKING_CONFIG['artifacts']['moco_snapshot']
 
 
 class RunPaths:
@@ -98,19 +104,30 @@ def mean_grad(rows):
     return sum(row['gradients']['query LoRA']['norm'] for row in rows) / len(rows)
 
 
-def run_identity(moco, optimizer, run_id, source_ids, provenance, base_fingerprints, run_config, runtime_device):
+def run_identity(
+    moco, optimizer, run_id, source_ids, provenance, base_fingerprints, run_config, runtime_device, *,
+    protocol=STAGE6B_PROTOCOL, protocol_version=PROTOCOL_VERSION,
+):
     implementation = provenance['implementation']
     return {
-        'run_id': run_id, 'protocol_version': PROTOCOL_VERSION,
-        'protocol': {'stream_mode': STAGE6B_PROTOCOL.stream_mode, 'key_transform': STAGE6B_PROTOCOL.key_transform,
-                     'negative_policy': STAGE6B_PROTOCOL.negative_policy},
+        'run_id': run_id, 'protocol_version': protocol_version,
+        'protocol': {'stream_mode': protocol.stream_mode, 'key_transform': protocol.key_transform,
+                     'negative_policy': protocol.negative_policy},
         'repository': implementation['repository'], 'branch': implementation['branch'],
         'commit': implementation['commit'], 'dirty': implementation['dirty'],
         'tracked_diff_sha256': implementation['tracked_diff_sha256'],
         'dependencies': {'versions': provenance.get('versions'),
                          'sequential_loader': provenance.get('sequential_loader')},
+        'dataset': run_config['dataset'],
+        'stream_config': {
+            'frames_per_chunk': run_config.get('frames_per_chunk', _SEQUENTIAL_CONFIG.frames_per_chunk),
+            'round_robin_stream_count': run_config.get(
+                'round_robin_stream_count', _SEQUENTIAL_CONFIG.round_robin_stream_count,
+            ),
+        },
         'base_model': provenance['base_model'], 'base_fingerprints': base_fingerprints,
-        'lora_config': lora_config(moco.query_encoder), 'queue_capacity': moco.queue.capacity,
+        'lora_config': lora_config(moco.query_encoder), 'feature_size': moco.feature_size,
+        'projection_size': moco.projection_size, 'queue_capacity': moco.queue.capacity,
         'momentum': moco.momentum, 'temperature': moco.temperature,
         'optimizer_config': optimizer_config(optimizer), 'seed': run_config['seed'],
         'device_identity': runtime_device,
@@ -118,8 +135,14 @@ def run_identity(moco, optimizer, run_id, source_ids, provenance, base_fingerpri
     }
 
 
-def _new_optimizer(moco, groups):
-    optimizer = torch.optim.AdamW(moco.query_parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+def _new_optimizer(moco, groups, optimizer_settings=None):
+    optimizer_settings = _MOCO_CONFIG.optimizer if optimizer_settings is None else optimizer_settings
+    if optimizer_settings.name != 'AdamW':
+        raise ValueError(f'Unsupported MoCo optimizer: {optimizer_settings.name}')
+    optimizer = torch.optim.AdamW(
+        moco.query_parameters(), lr=optimizer_settings.lr, weight_decay=optimizer_settings.weight_decay,
+        betas=optimizer_settings.betas, eps=optimizer_settings.eps,
+    )
     optimized = [p for group in optimizer.param_groups for p in group['params']]
     trainable = {**groups['query LoRA'], **groups['query Projector']}
     if len(optimized) != len(trainable) or {id(p) for p in optimized} != {id(p) for p in trainable.values()}:
@@ -141,8 +164,8 @@ def validate_full_sources(sources, expected_count):
 
 def run_full_streaming_moco(
     moco, processor, sources, device, run_dir, *, run_id, provenance, run_config, resume=False,
-    stop_after_videos=None, experiment=None, expected_source_count=ACTIVITYNET_TRAINING_COUNT,
-    resume_interval=RESUME_INTERVAL, snapshot_interval=SNAPSHOT_INTERVAL, metric_interval=METRIC_INTERVAL,
+    stop_after_videos=None, experiment=None, config=None, expected_source_count=None,
+    resume_interval=None, snapshot_interval=None, metric_interval=None,
 ):
     """Process `sources` once, or continue from `resume/latest.pt`.
 
@@ -150,9 +173,40 @@ def run_full_streaming_moco(
     boundary after writing `latest.pt` (non-final); the run continues only via
     an explicit resume. Any integrity, decode or numerical failure propagates.
     """
+    moco_settings = _MOCO_CONFIG if config is None else config.moco
+    sequential_settings = _SEQUENTIAL_CONFIG if config is None else config.sequential
+    protocol = moco_settings.protocol
+    protocol_version = moco_settings.protocol_version
+    optimizer_settings = moco_settings.optimizer
+    production_config = True if config is None else config.production_groups_match()
+    snapshot_artifact = SNAPSHOT_ARTIFACT if config is None else config.tracking['artifacts']['moco_snapshot']
+    if config is not None:
+        actual_lora = lora_config(moco.query_encoder)
+        expected_lora = config.encoder.lora.metadata()
+        if (
+            moco.feature_size, moco.projection_size, moco.queue.capacity, moco.momentum, moco.temperature,
+        ) != (
+            config.encoder.feature_size, moco_settings.projection_size, moco_settings.queue_capacity,
+            moco_settings.momentum, moco_settings.temperature,
+        ) or actual_lora != expected_lora:
+            raise RuntimeError('Resolved encoder/MoCo config differs from the constructed model')
+    expected_source_count = (
+        ACTIVITYNET_TRAINING_COUNT if expected_source_count is None and config is None
+        else config.activitynet.expected_source_counts['training'] if expected_source_count is None
+        else expected_source_count
+    )
+    resume_interval = moco_settings.intervals.resume_videos if resume_interval is None else resume_interval
+    snapshot_interval = moco_settings.intervals.snapshot_videos if snapshot_interval is None else snapshot_interval
+    metric_interval = moco_settings.intervals.comet_metric_updates if metric_interval is None else metric_interval
+    for name, value in (
+        ('expected_source_count', expected_source_count), ('resume_interval', resume_interval),
+        ('snapshot_interval', snapshot_interval), ('metric_interval', metric_interval),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f'{name} must be a positive integer')
     validate_full_sources(sources, expected_source_count)
-    if provenance.get('implementation', {}).get('dirty') is not False:
-        raise RuntimeError('Full-dataset MoCo requires a clean implementation checkout')
+    if production_config and provenance.get('implementation', {}).get('dirty') is not False:
+        raise RuntimeError('Production full-dataset MoCo requires a clean implementation checkout')
     if type(run_config.get('seed')) is not int or not 0 <= run_config['seed'] < 2 ** 32:
         raise RuntimeError('Full-dataset MoCo requires a resolved seed in [0, 2**32)')
     runtime_device = device_identity(device)
@@ -160,7 +214,6 @@ def run_full_streaming_moco(
         raise RuntimeError('Resolved device identity differs from the actual training device')
     if stop_after_videos is not None and (type(stop_after_videos) is not int or stop_after_videos < 1):
         raise ValueError('stop_after_videos must be a positive integer')
-    protocol = STAGE6B_PROTOCOL
     paths = RunPaths(run_dir)
     source_ids = [source.sequence_id for source in sources]
     groups = parameter_groups(moco)
@@ -173,9 +226,10 @@ def run_full_streaming_moco(
         if len(moco.queue) or any(p.grad is not None for p in moco.parameters()):
             raise RuntimeError('Resume requires a freshly constructed model')
         fingerprints = {side: base_fingerprint(getattr(moco, f'{side}_encoder')) for side in ('query', 'key')}
-        optimizer = _new_optimizer(moco, groups)
+        optimizer = _new_optimizer(moco, groups, optimizer_settings)
         identity = run_identity(
             moco, optimizer, run_id, source_ids, provenance, fingerprints, run_config, runtime_device,
+            protocol=protocol, protocol_version=protocol_version,
         )
         validate_resume_identity(checkpoint['identity'], identity)
         counters = dict(checkpoint['counters'])
@@ -214,11 +268,12 @@ def run_full_streaming_moco(
     def identity_now():
         return run_identity(
             moco, optimizer, run_id, source_ids, provenance, fingerprints, run_config, runtime_device,
+            protocol=protocol, protocol_version=protocol_version,
         )
 
     def snapshot_metadata(final):
         return {
-            'protocol_version': PROTOCOL_VERSION, 'run_id': run_id,
+            'protocol_version': protocol_version, 'run_id': run_id,
             'implementation': {key: provenance['implementation'].get(key) for key in (
                 'repository', 'branch', 'commit', 'dirty', 'tracked_diff_sha256')},
             'sequential_loader': provenance['sequential_loader'], 'base_model': provenance['base_model'],
@@ -227,11 +282,15 @@ def run_full_streaming_moco(
                         'ordered_source_sha256': ordered_source_sha256(source_ids)},
             'processed_videos': counters['processed_videos'],
             'global_update_step': counters['global_update_step'], 'final': final,
-            'protocol': identity_now()['protocol'], 'queue_capacity': moco.queue.capacity,
+            'protocol': identity_now()['protocol'],
+            'feature_size': moco.feature_size, 'projection_size': moco.projection_size,
+            'frames_per_chunk': sequential_settings.frames_per_chunk,
+            'queue_capacity': moco.queue.capacity,
             'momentum': moco.momentum, 'temperature': moco.temperature,
             'lora_config': lora_config(moco.query_encoder), 'optimizer_config': optimizer_config(optimizer),
             'seed': run_config['seed'], 'device_identity': runtime_device,
             'moco_experiment_key': None if experiment is None else experiment.get_key(),
+            'production_config': production_config,
             'created': utc_now(),
         }
 
@@ -241,10 +300,14 @@ def run_full_streaming_moco(
         if metadata.get('comet', {}).get('status') not in ('logged',):
             aliases = [f'run-{run_id}-videos-{counters["processed_videos"]:06d}'] + (
                 [f'run-{run_id}-final'] if final else [])
-            log_artifact(experiment, target, 'metadata.json', SNAPSHOT_ARTIFACT, 'model',
+            log_artifact(experiment, target, 'metadata.json', snapshot_artifact, 'model',
                          {file: metadata['files'][file] for file in SNAPSHOT_FILES},
                          {key: metadata[key] for key in ('run_id', 'processed_videos', 'global_update_step', 'final',
-                                                         'protocol_version')}, aliases)
+                                                         'protocol_version')}, aliases,
+                         project_name=(
+                             _TRACKING_CONFIG['comet_project'] if config is None
+                             else config.tracking['comet_project']
+                         ))
         recorder.event('evaluation_snapshot', path=str(target), **{
             key: counters[key] for key in ('processed_videos', 'global_update_step', 'final')})
 
@@ -271,9 +334,10 @@ def run_full_streaming_moco(
                 raise RuntimeError('This run already completed its single pass; final runs are not resumed')
         else:
             write_json_atomic(paths.metadata, {
-                'run_id': run_id, 'created': utc_now(), 'protocol_version': PROTOCOL_VERSION,
+                'run_id': run_id, 'created': utc_now(), 'protocol_version': protocol_version,
                 'config': run_config, 'provenance': provenance, 'source_count': len(source_ids),
                 'ordered_source_sha256': ordered_source_sha256(source_ids),
+                'production_config': production_config,
                 'moco_experiment_key': None if experiment is None else experiment.get_key(),
             })
             recorder.event('start', **counters)
@@ -281,7 +345,11 @@ def run_full_streaming_moco(
             source = sources[video_index]
             chunk_count = 0
             recorder.context = {'video_index': video_index}
-            with ordered_samples((source,), stream_mode=protocol.stream_mode) as samples:
+            with ordered_samples(
+                (source,), stream_mode=protocol.stream_mode,
+                frames_per_chunk=sequential_settings.frames_per_chunk,
+                round_robin_stream_count=sequential_settings.round_robin_stream_count,
+            ) as samples:
                 for sample in samples:
                     if not warmed:
                         if (video_index, sample.sequence_index, len(moco.queue)) != (0, 0, 0):
@@ -298,7 +366,7 @@ def run_full_streaming_moco(
                         recorder.event('warmup', sequence_id=sample.sequence_id,
                                        sequence_index=sample.sequence_index, queue_count=len(moco.queue))
                         del initial
-                        optimizer = _new_optimizer(moco, groups)
+                        optimizer = _new_optimizer(moco, groups, optimizer_settings)
                         warmed = True
                     else:
                         train_step(moco, processor, sample, device, optimizer, groups, before, expected_queue,
