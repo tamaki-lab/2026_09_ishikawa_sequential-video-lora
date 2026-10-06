@@ -9,10 +9,13 @@ import torch
 from anet_synthetic import ColorEncoder, RecordingProcessor, chunk_times
 from evaluation import activitynet_manifest as manifest
 from scripts.linear_probe import build_manifest, extract_features, run_probe
+from utils.artifact_io import sha256_file
 
 
-PROVENANCE = {'implementation': {'repository': 'repo', 'branch': 'dev', 'commit': 'abc', 'dirty': False},
-              'sequential_loader': {}, 'versions': {}}
+PROVENANCE = {'implementation': {'repository': 'repo', 'branch': 'dev', 'commit': 'abc', 'dirty': False,
+                                 'tracked_diff_sha256': 'clean'},
+              'sequential_loader': {'branch': 'ActivityNet', 'commit': 'loader', 'dirty': False},
+              'versions': {'python': 'test'}}
 
 
 def entry(subset, *annotations):
@@ -39,11 +42,11 @@ def cli(dataset, monkeypatch, tmp_path):
     monkeypatch.setattr(manifest, 'CLASS_COUNT', 2)
     monkeypatch.setattr(manifest, 'SPLIT_COUNTS', {'training': 2, 'validation': 1})
     for module in (build_manifest, extract_features, run_probe):
-        monkeypatch.setattr(module, 'collect_provenance', lambda: PROVENANCE)
+        monkeypatch.setattr(module, 'collect_provenance', lambda **kwargs: PROVENANCE)
     monkeypatch.setattr(extract_features.AutoImageProcessor, 'from_pretrained', lambda _: RecordingProcessor())
 
-    def encoder(condition, snapshot, production):
-        info = {'type': condition, 'base_model': 'base'}
+    def encoder(condition, snapshot, manifest_metadata):
+        info = {'type': condition, 'base_model': 'base', 'base_fingerprint': 'shared-base'}
         if condition == 'moco_query_lora_final':
             info['snapshot'] = {'path': str(snapshot), 'final': True, 'run_id': 'r'}
         return ColorEncoder(scale=1. if condition == 'base_vit' else 2.), info
@@ -71,6 +74,9 @@ def test_pipeline_gates_hashes_and_reuse(cli, capsys):
     metadata = json.loads((root / 'manifest' / 'm' / 'metadata.json').read_text())
     assert metadata['gate']['status'] == 'PASS' and metadata['gate']['reproducibility']['matches']
     assert metadata['comet']['status'] == 'disabled' and metadata['comet']['retry_needed']
+    with pytest.raises(RuntimeError, match='Dataset root differs'):
+        invoke(extract_features, '/different-anet', '--manifest-id', 'm', '--condition', 'base_vit',
+               '--device', 'cpu', *common)
 
     for condition, extra in (('base_vit', ()), ('moco_query_lora_final', ('--snapshot', root / 'snap'))):
         invoke(extract_features, '/anet', '--manifest-id', 'm', '--condition', condition, '--device', 'cpu',
@@ -89,7 +95,14 @@ def test_pipeline_gates_hashes_and_reuse(cli, capsys):
     probe_args = ('--manifest-id', 'm', '--base-features', base, '--lora-features', lora, '--smoke-epochs', '1')
     invoke(run_probe, *probe_args, *common)
     aggregate = json.loads((root / 'results' / 'comparison' / 'aggregate_summary.json').read_text())
+    aggregate_sidecar = json.loads((root / 'results' / 'comparison' / 'metadata.json').read_text())
     assert not aggregate['production'] and set(aggregate['conditions']) == {'base_vit', 'moco_query_lora_final'}
+    assert 'comet' not in aggregate
+    assert aggregate_sidecar['comet']['status'] == 'disabled' and aggregate_sidecar['comet']['retry_needed']
+    assert aggregate_sidecar['files'] == {
+        name: sha256_file(root / 'results' / 'comparison' / name)
+        for name in ('aggregate_summary.json', 'aggregate_summary.csv')
+    }
     for condition in aggregate['conditions'].values():
         assert condition['seeds'] == [0, 1, 2] and condition['top1_std'] is not None
     for condition in ('base_vit', 'moco_query_lora_final'):
@@ -99,5 +112,8 @@ def test_pipeline_gates_hashes_and_reuse(cli, capsys):
             assert summary['sample_counts'] == {'training': 3, 'validation': 2}
     invoke(run_probe, *probe_args, *common)
     assert 'Reusing identical aggregate result' in capsys.readouterr().out
+    (root / 'results' / 'comparison' / 'aggregate_summary.csv').write_bytes(b'corrupt')
+    with pytest.raises(RuntimeError, match='Aggregate CSV differs'):
+        invoke(run_probe, *probe_args, *common)
     with pytest.raises(RuntimeError, match='Different probe result'):
         invoke(run_probe, *probe_args[:-1], '2', *common)

@@ -78,6 +78,8 @@ def log_artifact(experiment, directory, metadata_name, name, artifact_type, file
     upload. The result is written into the local metadata JSON under `comet`.
     """
     directory = Path(directory)
+    if metadata_name in files:
+        raise ValueError('Mutable Comet metadata cannot also be an immutable artifact payload file')
     actual = artifact_files(directory, files)
     if actual != dict(files):
         raise RuntimeError(f'Local artifact hash changed before Comet upload: {directory}')

@@ -28,6 +28,9 @@ class ColorEncoder(nn.Module):
 class RecordingProcessor:
     """Processor stand-in: per-frame colour expanded to [N, 3, 224, 224]."""
 
+    def to_dict(self):
+        return {'processor': 'recording', 'size': 224}
+
     def __call__(self, *, images, return_tensors):
         assert return_tensors == 'pt'
         return {'pixel_values': images[:, :, :1, :1].float().expand(-1, 3, 224, 224).contiguous()}

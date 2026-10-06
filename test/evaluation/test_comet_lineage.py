@@ -58,6 +58,13 @@ def test_changed_local_file_blocks_upload(artifact):
     experiment.log_artifact.assert_not_called()
 
 
+def test_mutable_metadata_cannot_be_an_artifact_payload(artifact):
+    directory, files = artifact
+    files = {**files, 'metadata.json': sha256_file(directory / 'metadata.json')}
+    with pytest.raises(ValueError, match='metadata'):
+        lineage.log_artifact(None, directory, 'metadata.json', 'a', 'model', files, {})
+
+
 def test_experiment_start_failure_returns_status(monkeypatch):
     monkeypatch.setattr(comet_ml, 'Experiment', Mock(side_effect=ValueError('no key')))
     experiment, status = lineage.start_experiment('n', {'a': {'b': 1}})

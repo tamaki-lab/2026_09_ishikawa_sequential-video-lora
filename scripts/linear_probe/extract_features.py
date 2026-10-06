@@ -21,35 +21,108 @@ from evaluation import activitynet_manifest as manifest
 from evaluation import segment_features as features
 from logger.comet_lineage import end_experiment, log_artifact, start_experiment
 from model.backbones.vit import ViTFrameEncoder, ViTLoRAFrameEncoder
-from training.moco_checkpoint import base_fingerprint, load_query_lora_snapshot
-from utils.artifact_io import canonical_json_bytes, read_json, sha256_bytes
-from utils.provenance import CHECKPOINT_ID, collect_provenance, utc_now
+from training.moco_checkpoint import (
+    encoder_base_fingerprint, load_query_lora_snapshot, validate_production_snapshot_metadata,
+)
+from utils.artifact_io import canonical_json_bytes, read_json, sha256_bytes, sha256_file
+from utils.provenance import CHECKPOINT_ID, collect_provenance, device_identity, utc_now
 
 
 ARTIFACT_NAMES = {'base_vit': 'activitynet-segment-features-base-vit',
                   'moco_query_lora_final': 'activitynet-segment-features-moco-query-lora'}
+FEATURE_DEFINITION = {
+    'schema': 'activitynet-segment-feature-definition/v1',
+    'frame_feature': 'ViT CLS without pooler', 'chunk_aggregation': 'masked mean over valid frames',
+    'segment_aggregation': 'mean over manifest chunks', 'size': 768, 'dtype': 'float32',
+    'normalization': None,
+}
 
 
-def build_encoder(condition, snapshot, production):
+def dataset_sources_and_identity(dataset_root, adapter, manifest_metadata):
+    """Bind extraction to the exact manifest root, annotation and source order."""
+    resolved_root = str(Path(dataset_root).resolve())
+    expected_root = str(Path(manifest_metadata['dataset']['root']).resolve())
+    if resolved_root != expected_root:
+        raise RuntimeError(f'Dataset root differs from the manifest: {resolved_root} != {expected_root}')
+    sources_by_split, split_identity, annotation_paths = {}, {}, set()
+    for split in manifest.SPLITS:
+        sources = tuple(adapter.sequence_sources(split))
+        expected = manifest_metadata['splits'][split]
+        if len(sources) != manifest.SPLIT_COUNTS[split] or len(sources) != expected['source_count']:
+            raise RuntimeError(f'{split} source count differs from the manifest')
+        used_count = expected['used_source_count']
+        if not 0 < used_count <= len(sources):
+            raise RuntimeError(f'Invalid {split} used source count in the manifest')
+        ordered_sha = sha256_bytes(canonical_json_bytes(
+            [source.sequence_id for source in sources[:used_count]]
+        ))
+        if ordered_sha != expected['ordered_used_source_sha256']:
+            raise RuntimeError(f'{split} Adapter source order differs from the manifest')
+        annotation_paths.add(Path(sources[0].evaluation_reference.annotation_path))
+        sources_by_split[split] = sources
+        split_identity[split] = {
+            'source_count': len(sources), 'used_source_count': used_count,
+            'ordered_used_source_sha256': ordered_sha,
+        }
+    annotation_hashes = {sha256_file(path) for path in annotation_paths}
+    if annotation_hashes != {manifest_metadata['annotation']['sha256']}:
+        raise RuntimeError('ActivityNet annotation differs from the manifest')
+    return sources_by_split, {
+        'name': manifest_metadata['dataset']['name'], 'version': manifest_metadata['dataset']['version'],
+        'resolved_root': resolved_root, 'annotation_sha256': manifest_metadata['annotation']['sha256'],
+        'splits': split_identity,
+    }
+
+
+def extraction_provenance(provenance):
+    implementation = provenance['implementation']
+    return {
+        'implementation': {key: implementation.get(key) for key in (
+            'repository', 'commit', 'dirty', 'tracked_diff_sha256')},
+        'sequential_loader': provenance['sequential_loader'], 'versions': provenance['versions'],
+    }
+
+
+def preprocessing_identity(processor, frames_per_chunk):
+    configuration = processor.to_dict()
+    return {
+        'processor_checkpoint': CHECKPOINT_ID,
+        'processor_class': f'{type(processor).__module__}.{type(processor).__qualname__}',
+        'processor_config_sha256': sha256_bytes(canonical_json_bytes(configuration)),
+        'frames_per_chunk': frames_per_chunk, 'dtype': 'float32',
+    }
+
+
+def build_encoder(condition, snapshot, manifest_metadata):
     if condition == 'base_vit':
         if snapshot is not None:
             raise ValueError('base_vit takes no snapshot')
         encoder = ViTFrameEncoder(CHECKPOINT_ID)
         return encoder, {'type': 'base_vit', 'base_model': CHECKPOINT_ID,
-                         'base_fingerprint': base_fingerprint(encoder)}
+                         'base_fingerprint': encoder_base_fingerprint(encoder)}
     if snapshot is None:
         raise ValueError('moco_query_lora_final requires --snapshot')
     encoder = ViTLoRAFrameEncoder(CHECKPOINT_ID)
-    fingerprint = base_fingerprint(encoder)
+    fingerprint = encoder_base_fingerprint(encoder)
     metadata = load_query_lora_snapshot(encoder, snapshot)
-    if production and metadata['final'] is not True:
-        raise RuntimeError('Production features require the final Query LoRA snapshot')
+    if manifest_metadata['production']:
+        validate_production_snapshot_metadata(
+            metadata,
+            expected_source_sha256=manifest_metadata['splits']['training']['ordered_used_source_sha256'],
+            expected_dataset_root=manifest_metadata['dataset']['root'],
+            expected_base_fingerprint=fingerprint,
+            expected_source_count=manifest.SPLIT_COUNTS['training'],
+        )
+    snapshot_fields = (
+        'schema', 'protocol_version', 'run_id', 'implementation', 'sequential_loader', 'versions',
+        'base_model', 'base_fingerprint', 'dataset', 'processed_videos', 'global_update_step', 'final',
+        'protocol', 'queue_capacity', 'momentum', 'temperature', 'lora_config', 'optimizer_config',
+        'seed', 'device_identity', 'moco_experiment_key',
+    )
     return encoder, {
         'type': 'moco_query_lora', 'base_model': CHECKPOINT_ID, 'base_fingerprint': fingerprint,
-        'snapshot': {'path': str(snapshot), 'files': metadata['files'], 'run_id': metadata['run_id'],
-                     'processed_videos': metadata['processed_videos'],
-                     'global_update_step': metadata['global_update_step'], 'final': metadata['final'],
-                     'moco_experiment_key': metadata.get('moco_experiment_key'), 'comet': metadata.get('comet')},
+        'snapshot': {'local_path': str(snapshot), 'files': metadata['files'],
+                     **{key: metadata.get(key) for key in snapshot_fields}},
     }
 
 
@@ -71,8 +144,26 @@ def main():
     manifest_dir = args.output_root / 'manifest' / args.manifest_id
     rows, _, manifest_metadata = manifest.load_manifest(manifest_dir)
     production = manifest_metadata['production']
-    provenance = collect_provenance()
-    encoder, encoder_info = build_encoder(args.condition, args.snapshot, production)
+    provenance = collect_provenance(require_clean=production)
+    adapter = sl.ActivityNetAdapter(dataset_root=args.dataset_root.resolve())
+    sources_by_split, dataset_identity = dataset_sources_and_identity(
+        args.dataset_root, adapter, manifest_metadata,
+    )
+    processor = AutoImageProcessor.from_pretrained(CHECKPOINT_ID)
+    preprocessing = preprocessing_identity(processor, manifest_metadata['frames_per_chunk'])
+    encoder, encoder_info = build_encoder(args.condition, args.snapshot, manifest_metadata)
+    device = torch.device(args.device)
+    shared_contract = {
+        'schema': 'activitynet-shared-segment-feature-contract/v1',
+        'dataset': dataset_identity,
+        'manifest': {key: manifest_metadata[key] for key in (
+            'manifest_id', 'segment_manifest_sha256', 'label_mapping_sha256')},
+        'base_encoder': {'model': CHECKPOINT_ID, 'fingerprint': encoder_info['base_fingerprint']},
+        'preprocessing': preprocessing, 'feature_definition': FEATURE_DEFINITION,
+        'extraction_provenance': extraction_provenance(provenance),
+        'device_identity': device_identity(device),
+    }
+    shared_contract_sha = sha256_bytes(canonical_json_bytes(shared_contract))
     encoder_sha = sha256_bytes(canonical_json_bytes(encoder_info))
     feature_id = args.feature_id or f'{args.manifest_id}__{encoder_sha[:12]}'
     directory = args.output_root / 'features' / args.condition / feature_id
@@ -82,23 +173,21 @@ def main():
             'manifest_id', 'segment_manifest_sha256', 'label_mapping_sha256')}
         | {'local_path': str(manifest_dir), 'comet': manifest_metadata.get('comet')},
         'encoder': encoder_info, 'encoder_sha256': encoder_sha,
-        'feature_definition': 'valid frame CLS [T,768] -> masked mean chunk [768] -> mean of manifest chunks; '
-                              'raw float32, no normalization',
-        'preprocessing': {'processor': CHECKPOINT_ID, 'frames_per_chunk': 16, 'dtype': 'float32'},
+        'feature_definition': FEATURE_DEFINITION, 'preprocessing': preprocessing,
+        'shared_feature_contract': shared_contract,
+        'shared_feature_contract_sha256': shared_contract_sha,
     }
     if directory.exists():
         existing = read_json(directory / 'metadata.json')
         if {key: existing.get(key) for key in inputs if key != 'manifest'} != {
             key: value for key, value in inputs.items() if key != 'manifest'
-        } or existing['manifest']['segment_manifest_sha256'] != inputs['manifest']['segment_manifest_sha256']:
+        } or any(existing['manifest'].get(key) != inputs['manifest'][key] for key in (
+            'manifest_id', 'segment_manifest_sha256', 'label_mapping_sha256')):
             raise RuntimeError(f'Different feature artifact already exists: {directory}')
         features.load_features(directory, rows, manifest_metadata, args.condition)
         print(f'Reusing verified feature artifact: {directory}', flush=True)
         return
 
-    adapter = sl.ActivityNetAdapter(dataset_root=args.dataset_root)
-    device = torch.device(args.device)
-    processor = AutoImageProcessor.from_pretrained(CHECKPOINT_ID)
     # Extraction never trains: both encoders are fully frozen and in eval mode.
     encoder = encoder.to(device).eval().requires_grad_(False)
     experiment, comet = start_experiment(
@@ -112,7 +201,7 @@ def main():
             if done == total or done % 100 == 0:
                 print(json.dumps({'event': 'feature_progress', 'split': split, 'videos': done, 'total': total}),
                       flush=True)
-        splits[split] = features.extract_split(split_rows, adapter.sequence_sources(split), processor, encoder,
+        splits[split] = features.extract_split(split_rows, sources_by_split[split], processor, encoder,
                                                device, progress)
     metadata = features.write_feature_artifact(directory, splits, rows, {
         **inputs, 'counts': {split: len(splits[split]['segment_ids']) for split in manifest.SPLITS},
@@ -122,7 +211,9 @@ def main():
     status = log_artifact(experiment, directory, 'metadata.json', ARTIFACT_NAMES[args.condition], 'dataset',
                           metadata['files'], {'feature_id': feature_id, 'condition': args.condition,
                                               'segment_manifest_sha256': manifest_metadata['segment_manifest_sha256'],
-                                              'encoder_sha256': encoder_sha}, aliases=(feature_id,))
+                                              'encoder_sha256': encoder_sha,
+                                              'shared_feature_contract_sha256': shared_contract_sha},
+                          aliases=(feature_id,))
     end_experiment(experiment)
     print(json.dumps({'event': 'features_written', 'path': str(directory), 'files': metadata['files'],
                       'counts': metadata['counts'], 'comet': {**comet, **status}}), flush=True)

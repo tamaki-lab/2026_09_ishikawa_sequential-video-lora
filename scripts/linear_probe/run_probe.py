@@ -19,12 +19,26 @@ from evaluation import linear_probe as probe
 from evaluation import activitynet_manifest as manifest
 from evaluation import segment_features as features
 from logger.comet_lineage import end_experiment, log_artifact, log_metrics, start_experiment
+from training.moco_checkpoint import validate_production_snapshot_metadata
 from utils.artifact_io import canonical_json_bytes, read_json, sha256_bytes, sha256_file
 from utils.artifact_io import write_bytes_atomic, write_json_atomic
 from utils.provenance import collect_provenance, utc_now
 
 
 ARTIFACT_NAME = 'activitynet-linear-probe-results'
+AGGREGATE_METADATA_SCHEMA = 'activitynet-linear-probe-aggregate-metadata/v1'
+AGGREGATE_PAYLOAD_FILES = ('aggregate_summary.json', 'aggregate_summary.csv')
+
+
+def aggregate_metadata(comparison, files):
+    return {
+        'schema': AGGREGATE_METADATA_SCHEMA, 'aggregate_schema': probe.AGGREGATE_SCHEMA,
+        'files': files, 'local_path': str(comparison), 'created': utc_now(),
+        'comet': {
+            'status': 'pending', 'retry_needed': True, 'artifact_name': ARTIFACT_NAME,
+            'artifact_type': 'results', 'aliases': [], 'files': files, 'time': utc_now(),
+        },
+    }
 
 
 def run_seed(args, condition, seed, splits, feature_metadata, manifest_metadata, label_names, provenance,
@@ -38,6 +52,7 @@ def run_seed(args, condition, seed, splits, feature_metadata, manifest_metadata,
         | {'comet_artifact_version': (manifest_metadata.get('comet') or {}).get('artifact_version')},
         'features': {'feature_id': feature_metadata['feature_id'], 'files': feature_metadata['files'],
                      'local_path': feature_metadata['local_path'], 'encoder_sha256': feature_metadata['encoder_sha256'],
+                     'shared_feature_contract_sha256': feature_metadata['shared_feature_contract_sha256'],
                      'comet_artifact_version': (feature_metadata.get('comet') or {}).get('artifact_version'),
                      'upstream_experiment_key': (feature_metadata.get('comet') or {}).get('experiment_key')},
     }
@@ -102,16 +117,25 @@ def main():
         'moco_query_lora_final': features.load_features(
             args.lora_features, rows, manifest_metadata, 'moco_query_lora_final'),
     }
+    shared_contract = features.validate_feature_pair(loaded['base_vit'][1], loaded['moco_query_lora_final'][1])
     for split in manifest.SPLITS:
         if loaded['base_vit'][0][split]['segment_ids'] != loaded['moco_query_lora_final'][0][split]['segment_ids']:
             raise RuntimeError(f'Base / LoRA {split} segment IDs differ')
     snapshot = loaded['moco_query_lora_final'][1]['encoder']['snapshot']
+    if manifest_metadata['production'] and args.smoke_epochs is None:
+        validate_production_snapshot_metadata(
+            snapshot,
+            expected_source_sha256=manifest_metadata['splits']['training']['ordered_used_source_sha256'],
+            expected_dataset_root=manifest_metadata['dataset']['root'],
+            expected_base_fingerprint=shared_contract['base_encoder']['fingerprint'],
+            expected_source_count=manifest.SPLIT_COUNTS['training'],
+        )
     production = (manifest_metadata['production'] and args.smoke_epochs is None and snapshot['final'] is True
                   and all(metadata['production'] for _, metadata in loaded.values()))
     if manifest_metadata['production'] and args.smoke_epochs is None and not production:
         raise RuntimeError('Production probe requires production features from the final Query LoRA snapshot')
     epochs = args.smoke_epochs or probe.HYPERPARAMETERS['epochs']
-    provenance = collect_provenance()
+    provenance = collect_provenance(require_clean=production)
     summaries = [
         run_seed(args, condition, seed, splits, feature_metadata, manifest_metadata, label_names, provenance,
                  production, epochs)
@@ -125,31 +149,54 @@ def main():
         'schema': probe.AGGREGATE_SCHEMA, 'protocol': probe.PROTOCOL, 'production': production,
         'primary_metric': 'top1', 'secondary_metric': 'macro_class_accuracy', 'std': 'sample (ddof=1)',
         'conditions': result,
-        'inputs': {condition: {'feature_id': metadata['feature_id'], 'files': metadata['files']}
+        'inputs': {condition: {'feature_id': metadata['feature_id'], 'files': metadata['files'],
+                               'shared_feature_contract_sha256': metadata['shared_feature_contract_sha256']}
                    for condition, (_, metadata) in loaded.items()},
         'segment_manifest_sha256': manifest_metadata['segment_manifest_sha256'],
         'seed_results': {f'{row["condition"]}/seed-{row["seed"]}': row['files'] for row in summaries},
         'probe_experiment_keys': {probe.experiment_name(row['condition'], row['seed']): row['comet_experiment_key']
                                   for row in summaries},
-        'moco_snapshot': snapshot, 'created': utc_now(),
+        'moco_snapshot': snapshot, 'lineage_metadata': 'metadata.json', 'created': utc_now(),
     }
     identity = ('production', 'conditions', 'inputs', 'segment_manifest_sha256', 'seed_results')
-    if (comparison / 'aggregate_summary.json').exists():
-        existing = read_json(comparison / 'aggregate_summary.json')
+    summary_path = comparison / 'aggregate_summary.json'
+    csv_path = comparison / 'aggregate_summary.csv'
+    metadata_path = comparison / 'metadata.json'
+    csv_bytes = probe.aggregate_csv(result)
+    if summary_path.exists():
+        if not csv_path.is_file():
+            raise RuntimeError(f'Aggregate CSV is missing: {csv_path}')
+        existing = read_json(summary_path)
+        if existing.get('schema') != probe.AGGREGATE_SCHEMA or 'comet' in existing:
+            raise RuntimeError(f'Unsupported or mutable aggregate summary: {summary_path}')
         if {key: existing.get(key) for key in identity} != {key: aggregate[key] for key in identity}:
             raise RuntimeError(f'Different aggregate result already exists: {comparison}')
+        if csv_path.read_bytes() != csv_bytes:
+            raise RuntimeError(f'Aggregate CSV differs from the seed results: {csv_path}')
+        files = {name: sha256_file(comparison / name) for name in AGGREGATE_PAYLOAD_FILES}
+        if metadata_path.exists():
+            sidecar = read_json(metadata_path)
+            if sidecar.get('schema') != AGGREGATE_METADATA_SCHEMA or sidecar.get('files') != files or (
+                sidecar.get('comet') or {}
+            ).get('files') != files:
+                raise RuntimeError(f'Aggregate lineage metadata differs from payload hashes: {metadata_path}')
+        else:
+            write_json_atomic(metadata_path, aggregate_metadata(comparison, files))
         print(f'Reusing identical aggregate result: {comparison}', flush=True)
         return
-    write_json_atomic(comparison / 'aggregate_summary.json', aggregate)
-    write_bytes_atomic(comparison / 'aggregate_summary.csv', probe.aggregate_csv(result))
+    if csv_path.exists() or metadata_path.exists():
+        raise RuntimeError(f'Incomplete aggregate result already exists: {comparison}')
+    write_json_atomic(summary_path, aggregate)
+    write_bytes_atomic(csv_path, csv_bytes)
+    files = {name: sha256_file(comparison / name) for name in AGGREGATE_PAYLOAD_FILES}
+    write_json_atomic(metadata_path, aggregate_metadata(comparison, files))
     experiment, comet = start_experiment(f'{probe.PROTOCOL}__aggregate', {
         key: aggregate[key] for key in ('production', 'segment_manifest_sha256', 'probe_experiment_keys', 'inputs')
     }, tags=('linear-probe', 'aggregate'), disabled=args.disable_comet)
     for condition, values in result.items():
         log_metrics(experiment, {f'{condition}/top1_mean': values['top1_mean'],
                                  f'{condition}/macro_class_accuracy_mean': values['macro_class_accuracy_mean']})
-    files = {name: sha256_file(comparison / name) for name in ('aggregate_summary.json', 'aggregate_summary.csv')}
-    status = log_artifact(experiment, comparison, 'aggregate_summary.json', ARTIFACT_NAME, 'results', files,
+    status = log_artifact(experiment, comparison, 'metadata.json', ARTIFACT_NAME, 'results', files,
                           {'production': production, 'segment_manifest_sha256': aggregate['segment_manifest_sha256'],
                            'aggregate_sha256': files['aggregate_summary.json'],
                            'inputs_sha256': sha256_bytes(canonical_json_bytes(aggregate['inputs']))})

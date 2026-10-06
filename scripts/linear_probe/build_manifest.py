@@ -28,7 +28,7 @@ ARTIFACT_NAME = 'activitynet-linear-probe-manifest'
 
 
 def selected_sources(dataset_root, max_videos):
-    adapter = sl.ActivityNetAdapter(dataset_root=dataset_root)
+    adapter = sl.ActivityNetAdapter(dataset_root=Path(dataset_root).resolve())
     full = {split: adapter.sequence_sources(split) for split in manifest.SPLITS}
     for split, count in manifest.SPLIT_COUNTS.items():
         if len(full[split]) != count:
@@ -58,7 +58,7 @@ def build(args, directory):
     metadata = {
         'schema': manifest.MANIFEST_SCHEMA, 'manifest_id': args.manifest_id, 'production': production,
         'scope': {'max_videos_per_split': args.max_videos_per_split},
-        'dataset': {'name': 'ActivityNet', 'version': '1.3', 'root': str(args.dataset_root)},
+        'dataset': {'name': 'ActivityNet', 'version': '1.3', 'root': str(args.dataset_root.resolve())},
         'annotation': {'path': str(annotation_path), 'sha256': sha256_file(annotation_path)},
         'splits': {split: {
             'source_count': len(full[split]), 'used_source_count': len(used[split]),

@@ -1,7 +1,7 @@
 """Retry a failed or disabled Comet artifact registration for a local artifact.
 
     python -m scripts.retry_comet_artifact log/linear_probe/manifest/lp-v1
-    python -m scripts.retry_comet_artifact log/linear_probe/results/comparison --metadata-name aggregate_summary.json
+    python -m scripts.retry_comet_artifact log/linear_probe/results/comparison
 
 Uses the artifact name, type, aliases and file hashes recorded under `comet` in
 the local metadata. Local SHA-256 is re-verified before upload; a mismatch stops.

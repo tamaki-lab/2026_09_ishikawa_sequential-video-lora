@@ -13,14 +13,38 @@ import torch
 from integration.sequential_vit import encode_chunk
 from model.aggregators import MaskedMeanClipAggregator
 from integration.sequential_stream import ordered_samples
-from utils.artifact_io import read_json, sha256_file, write_bytes_atomic, write_json_atomic
+from utils.artifact_io import canonical_json_bytes, read_json, sha256_bytes, sha256_file
+from utils.artifact_io import write_bytes_atomic, write_json_atomic
 from .activitynet_manifest import SPLITS, chunk_in_segment
 
 
-FEATURE_SCHEMA = 'activitynet-segment-features/v1'
+FEATURE_SCHEMA = 'activitynet-segment-features/v2'
 FEATURE_SIZE = 768
 CONDITIONS = ('base_vit', 'moco_query_lora_final')
 FEATURE_FILES = tuple(f'{split}/features.pt' for split in SPLITS)
+
+
+def shared_contract_sha256(contract):
+    return sha256_bytes(canonical_json_bytes(contract))
+
+
+def validate_shared_contract(metadata):
+    contract = metadata.get('shared_feature_contract')
+    recorded = metadata.get('shared_feature_contract_sha256')
+    if not isinstance(contract, dict) or shared_contract_sha256(contract) != recorded:
+        raise RuntimeError('Feature shared contract hash does not match its metadata')
+    return contract
+
+
+def validate_feature_pair(base_metadata, lora_metadata):
+    """Require every comparison axis except the intended LoRA condition to match."""
+    base = validate_shared_contract(base_metadata)
+    lora = validate_shared_contract(lora_metadata)
+    if base != lora or base_metadata['shared_feature_contract_sha256'] != lora_metadata[
+        'shared_feature_contract_sha256'
+    ]:
+        raise RuntimeError('Base / LoRA shared feature contracts differ')
+    return base
 
 
 @torch.no_grad()
@@ -104,9 +128,12 @@ def load_features(directory, rows, manifest_metadata, condition=None):
         raise RuntimeError(f'Unsupported feature schema: {metadata.get("schema")}')
     if condition is not None and metadata['condition'] != condition:
         raise RuntimeError(f'Expected {condition} features, got {metadata["condition"]}')
+    contract = validate_shared_contract(metadata)
     for key in ('segment_manifest_sha256', 'label_mapping_sha256'):
         if metadata['manifest'][key] != manifest_metadata[key]:
             raise RuntimeError(f'Feature artifact was extracted from a different manifest ({key})')
+        if contract['manifest'][key] != manifest_metadata[key]:
+            raise RuntimeError(f'Feature shared contract differs from the manifest ({key})')
     if {file: sha256_file(directory / file) for file in FEATURE_FILES} != metadata['files']:
         raise RuntimeError('Feature files differ from metadata hashes')
     splits = {}
@@ -118,6 +145,7 @@ def load_features(directory, rows, manifest_metadata, condition=None):
 
 def write_feature_artifact(directory, splits, rows, metadata):
     directory = Path(directory)
+    validate_shared_contract(metadata)
     for split in SPLITS:
         verify_split(splits[split], rows, split)
         save_split(directory / split / 'features.pt', splits[split])

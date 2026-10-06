@@ -75,8 +75,11 @@ def test_artifact_round_trip_and_rejections(setup, tmp_path):
     sources, rows = setup
     splits = extract(sources, rows, ColorEncoder())
     manifest_metadata = {'segment_manifest_sha256': 'm', 'label_mapping_sha256': 'l'}
+    contract = {'manifest': dict(manifest_metadata), 'common': 'same'}
     metadata = features.write_feature_artifact(tmp_path / 'f', splits, rows, {
-        'condition': 'base_vit', 'manifest': dict(manifest_metadata)})
+        'condition': 'base_vit', 'manifest': dict(manifest_metadata),
+        'shared_feature_contract': contract,
+        'shared_feature_contract_sha256': features.shared_contract_sha256(contract)})
     assert set(metadata['files']) == {'training/features.pt', 'validation/features.pt'}
     loaded, _ = features.load_features(tmp_path / 'f', rows, manifest_metadata, 'base_vit')
     assert torch.equal(loaded['training']['features'], splits['training']['features'])
@@ -93,6 +96,22 @@ def test_artifact_round_trip_and_rejections(setup, tmp_path):
     (tmp_path / 'f' / 'training' / 'features.pt').write_bytes(b'tampered')
     with pytest.raises(RuntimeError, match='hashes'):
         features.load_features(tmp_path / 'f', rows, manifest_metadata)
+
+
+def test_shared_feature_contract_pair_validation():
+    contract = {'manifest': {'segment_manifest_sha256': 'm', 'label_mapping_sha256': 'l'},
+                'preprocessing': {'processor': 'same'}}
+    metadata = {'shared_feature_contract': contract,
+                'shared_feature_contract_sha256': features.shared_contract_sha256(contract)}
+    assert features.validate_feature_pair(metadata, dict(metadata)) == contract
+    changed = {**contract, 'preprocessing': {'processor': 'different'}}
+    with pytest.raises(RuntimeError, match='contracts differ'):
+        features.validate_feature_pair(metadata, {
+            'shared_feature_contract': changed,
+            'shared_feature_contract_sha256': features.shared_contract_sha256(changed),
+        })
+    with pytest.raises(RuntimeError, match='contract hash'):
+        features.validate_shared_contract({**metadata, 'shared_feature_contract_sha256': 'tampered'})
 
 
 def test_changed_timestamps_are_rejected_at_extraction(setup, videos):
