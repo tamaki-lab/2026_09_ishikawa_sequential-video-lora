@@ -59,6 +59,7 @@ def run_seed(
         'science': science,
         'manifest': {key: manifest_metadata[key] for key in (
             'manifest_id', 'segment_manifest_sha256', 'label_mapping_sha256')},
+        'selection_sha256': manifest_metadata.get('selection_sha256'),
         'features': {'feature_id': feature_metadata['feature_id'], 'files': feature_metadata['files'],
                      'encoder_sha256': feature_metadata['encoder_sha256'],
                      'shared_feature_contract_sha256': feature_metadata['shared_feature_contract_sha256'],
@@ -149,6 +150,8 @@ def run(cfg):
     for _, metadata in loaded.values():
         if (metadata.get('science') or {}).get('sha256') != feature_science['sha256']:
             raise RuntimeError('Feature artifact was built with a different feature configuration')
+        if metadata.get('selection_sha256') != manifest_metadata.get('selection_sha256'):
+            raise RuntimeError('Feature artifact and manifest source selections differ')
     shared_contract = features.validate_feature_pair(loaded['base_vit'][1], loaded['moco_query_lora_final'][1])
     for split in manifest.SPLITS:
         if loaded['base_vit'][0][split]['segment_ids'] != loaded['moco_query_lora_final'][0][split]['segment_ids']:
@@ -160,6 +163,7 @@ def run(cfg):
     probe_science = science_contract(cfg)
     result_identity = {
         'science_sha256': probe_science['sha256'],
+        'selection_sha256': manifest_metadata.get('selection_sha256'),
         'manifest': {key: manifest_metadata[key] for key in (
             'segment_manifest_sha256', 'label_mapping_sha256',
         )},
@@ -186,11 +190,25 @@ def run(cfg):
         and class_count == resolved['activitynet']['class_count']
     )
     if production:
+        expected_selection = None
+        if manifest_metadata.get('selection_sha256') is not None:
+            expected_selection = {
+                'source_selection': manifest_metadata['source_selection'],
+                'selection_sha256': manifest_metadata['selection_sha256'],
+            }
+        protocol_version = (
+            'activitynet-selected-single-pass-streaming-moco/v1'
+            if (manifest_metadata.get('source_selection') or {}).get('strategy')
+            == 'sha256_rank_preserve_adapter_order_v1'
+            else 'activitynet-full-single-pass-streaming-moco/v2'
+        )
         validate_production_snapshot_metadata(
             snapshot,
             expected_source_sha256=manifest_metadata['splits']['training']['ordered_used_source_sha256'],
             expected_base_fingerprint=shared_contract['base_encoder']['fingerprint'],
-            expected_source_count=resolved['activitynet']['expected_source_counts']['training'],
+            expected_source_count=manifest_metadata['splits']['training']['used_source_count'],
+            expected_selection=expected_selection,
+            expected_protocol_version=protocol_version,
         )
     provenance = collect_provenance(policy=resolved['provenance'], require_clean=production)
     summaries = [
@@ -216,6 +234,7 @@ def run(cfg):
                                'shared_feature_contract_sha256': metadata['shared_feature_contract_sha256']}
                    for condition, (_, metadata) in loaded.items()},
         'segment_manifest_sha256': manifest_metadata['segment_manifest_sha256'],
+        'selection_sha256': manifest_metadata.get('selection_sha256'),
         'seed_results': {f'{row["condition"]}/seed-{row["seed"]}': row['files'] for row in summaries},
         'probe_experiment_keys': {
             probe.experiment_name(probe_config.protocol, row['condition'], row['seed']): row['comet_experiment_key']
@@ -225,7 +244,7 @@ def run(cfg):
     }
     identity = (
         'production', 'science', 'result_id', 'result_identity_sha256', 'conditions', 'inputs',
-        'segment_manifest_sha256', 'seed_results',
+        'segment_manifest_sha256', 'selection_sha256', 'seed_results',
     )
     summary_path = comparison / 'aggregate_summary.json'
     csv_path = comparison / 'aggregate_summary.csv'
@@ -265,7 +284,9 @@ def run(cfg):
         comparison, files, artifact_name, resolved['tracking']['comet_project'],
     ))
     experiment, comet = start_experiment(f'{probe_config.protocol}__aggregate', {
-        key: aggregate[key] for key in ('production', 'segment_manifest_sha256', 'probe_experiment_keys', 'inputs')
+        key: aggregate[key] for key in (
+            'production', 'segment_manifest_sha256', 'selection_sha256', 'probe_experiment_keys', 'inputs',
+        )
     }, tags=('linear-probe', 'aggregate', scope_tag(production), display_tag(probe_config.protocol)),
         disabled=runtime['disable_comet'], project_name=resolved['tracking']['comet_project'])
     for condition, values in result.items():
@@ -273,6 +294,7 @@ def run(cfg):
                                  f'{condition}/macro_class_accuracy_mean': values['macro_class_accuracy_mean']})
     status = log_artifact(experiment, comparison, 'metadata.json', artifact_name, 'results', files,
                           {'production': production, 'segment_manifest_sha256': aggregate['segment_manifest_sha256'],
+                           'selection_sha256': aggregate.get('selection_sha256'),
                            'aggregate_sha256': files['aggregate_summary.json'],
                            'inputs_sha256': sha256_bytes(canonical_json_bytes(aggregate['inputs']))},
                           project_name=resolved['tracking']['comet_project'])

@@ -50,6 +50,8 @@ def validate_shared_contract(metadata):
         raise RuntimeError('Feature shared contract hash does not match its metadata')
     if 'science' in metadata and metadata['science'] != contract.get('science'):
         raise RuntimeError('Feature science metadata differs from the shared contract')
+    if metadata.get('selection_sha256') != contract.get('selection_sha256'):
+        raise RuntimeError('Feature selection metadata differs from the shared contract')
     return contract
 
 

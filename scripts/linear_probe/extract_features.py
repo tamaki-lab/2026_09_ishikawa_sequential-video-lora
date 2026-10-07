@@ -20,6 +20,9 @@ from transformers import AutoImageProcessor
 
 from evaluation import activitynet_manifest as manifest
 from evaluation import segment_features as features
+from integration.activitynet_source_selection import (
+    ALL_SOURCES_STRATEGY, SourceSelectionConfig, select_activitynet_sources, validate_selection_metadata,
+)
 from logger.comet_lineage import display_tag, end_experiment, log_artifact, scope_tag, start_experiment
 from model.backbones.vit import ViTFrameEncoder, ViTLoRAFrameEncoder
 from training.moco_checkpoint import (
@@ -34,24 +37,55 @@ from utils.provenance import collect_provenance, device_identity, utc_now
 MANIFEST_SCIENCE_GROUPS = ('activitynet', 'sequential', 'provenance')
 
 
-def dataset_sources_and_identity(adapter, manifest_metadata, expected_counts):
+def full_sources_and_selection(adapter, resolved, sequential_loader):
+    expected_counts = resolved['activitynet']['expected_source_counts']
+    full = {split: tuple(adapter.sequence_sources(split)) for split in manifest.SPLITS}
+    for split, sources in full.items():
+        if len(sources) != expected_counts[split]:
+            raise RuntimeError(f'{split} source count differs from the ActivityNet contract')
+        if len({source.sequence_id for source in sources}) != len(sources):
+            raise RuntimeError(f'{split} source IDs must be unique')
+    annotation_paths = {
+        Path(source.evaluation_reference.annotation_path)
+        for sources in full.values() for source in sources
+    }
+    annotation_hashes = {sha256_file(path) for path in annotation_paths}
+    if len(annotation_hashes) != 1:
+        raise RuntimeError('ActivityNet splits must use one identical annotation file')
+    config = SourceSelectionConfig.from_mapping(resolved['source_selection'], expected_counts)
+    selection = select_activitynet_sources(
+        full, config, expected_counts=expected_counts,
+        dataset={'name': resolved['activitynet']['name'], 'version': resolved['activitynet']['version']},
+        sequential_loader=sequential_loader,
+        annotation_sha256=next(iter(annotation_hashes)),
+    )
+    return full, selection
+
+
+def dataset_sources_and_identity(full, selection, manifest_metadata, expected_counts):
     """Bind extraction to annotation content and source order, not its mount path."""
     sources_by_split, split_identity, annotation_paths = {}, {}, set()
     for split in manifest.SPLITS:
-        sources = tuple(adapter.sequence_sources(split))
+        sources = full[split]
         expected = manifest_metadata['splits'][split]
         if len(sources) != expected_counts[split] or len(sources) != expected['source_count']:
             raise RuntimeError(f'{split} source count differs from the manifest')
         used_count = expected['used_source_count']
         if not 0 < used_count <= len(sources):
             raise RuntimeError(f'Invalid {split} used source count in the manifest')
+        if manifest_metadata.get('source_selection') is not None:
+            validate_selection_metadata(manifest_metadata, selection)
+            used_sources = selection.sources[split]
+        else:
+            # Compatibility with existing full/legacy-smoke manifests.
+            used_sources = sources[:used_count]
         ordered_sha = sha256_bytes(canonical_json_bytes(
-            [source.sequence_id for source in sources[:used_count]]
+            [source.sequence_id for source in used_sources]
         ))
         if ordered_sha != expected['ordered_used_source_sha256']:
             raise RuntimeError(f'{split} Adapter source order differs from the manifest')
         annotation_paths.add(Path(sources[0].evaluation_reference.annotation_path))
-        sources_by_split[split] = sources
+        sources_by_split[split] = used_sources
         split_identity[split] = {
             'source_count': len(sources), 'used_source_count': used_count,
             'ordered_used_source_sha256': ordered_sha,
@@ -59,11 +93,14 @@ def dataset_sources_and_identity(adapter, manifest_metadata, expected_counts):
     annotation_hashes = {sha256_file(path) for path in annotation_paths}
     if annotation_hashes != {manifest_metadata['annotation']['sha256']}:
         raise RuntimeError('ActivityNet annotation differs from the manifest')
-    return sources_by_split, {
+    identity = {
         'name': manifest_metadata['dataset']['name'], 'version': manifest_metadata['dataset']['version'],
         'annotation_sha256': manifest_metadata['annotation']['sha256'],
         'splits': split_identity,
     }
+    if manifest_metadata.get('selection_sha256') is not None:
+        identity['selection_sha256'] = manifest_metadata['selection_sha256']
+    return sources_by_split, identity
 
 
 def extraction_provenance(provenance):
@@ -85,7 +122,10 @@ def preprocessing_identity(processor, checkpoint_id, frames_per_chunk):
     }
 
 
-def build_encoder(condition, snapshot, manifest_metadata, encoder_config, production, expected_source_count):
+def build_encoder(
+    condition, snapshot, manifest_metadata, encoder_config, production, expected_source_count,
+    expected_protocol_version=None,
+):
     encoder_kwargs = {
         'feature_size': encoder_config['feature_size'], 'image_size': encoder_config['image_size'],
         'channels': encoder_config['channels'],
@@ -106,12 +146,25 @@ def build_encoder(condition, snapshot, manifest_metadata, encoder_config, produc
     )
     fingerprint = encoder_base_fingerprint(encoder)
     metadata = load_query_lora_snapshot(encoder, snapshot)
+    expected_selection = None
+    if manifest_metadata.get('selection_sha256') is not None:
+        expected_selection = {
+            'source_selection': manifest_metadata['source_selection'],
+            'selection_sha256': manifest_metadata['selection_sha256'],
+        }
+        if (
+            metadata.get('selection_sha256') != expected_selection['selection_sha256']
+            or metadata.get('source_selection') != expected_selection['source_selection']
+        ):
+            raise RuntimeError('Final Query LoRA snapshot and manifest source selections differ')
     if production:
         validate_production_snapshot_metadata(
             metadata,
             expected_source_sha256=manifest_metadata['splits']['training']['ordered_used_source_sha256'],
             expected_base_fingerprint=fingerprint,
             expected_source_count=expected_source_count,
+            expected_selection=expected_selection,
+            expected_protocol_version=expected_protocol_version,
         )
     snapshot_fields = (
         'schema', 'protocol_version', 'run_id', 'implementation', 'sequential_loader', 'versions',
@@ -119,6 +172,7 @@ def build_encoder(condition, snapshot, manifest_metadata, encoder_config, produc
         'protocol', 'feature_size', 'projection_size', 'frames_per_chunk', 'queue_capacity',
         'momentum', 'temperature', 'lora_config', 'optimizer_config',
         'seed', 'device_identity', 'moco_experiment_key', 'production_config',
+        'source_selection', 'selection_sha256', 'selection_record',
     )
     snapshot_identity = {key: metadata.get(key) for key in snapshot_fields}
     if isinstance(snapshot_identity.get('dataset'), dict):
@@ -157,17 +211,28 @@ def run(cfg):
     output_root = Path(runtime['output_root'])
     dataset_root = Path(runtime['dataset_root']).resolve()
     snapshot = None if runtime['snapshot'] is None else Path(runtime['snapshot'])
-    manifest_dir = output_root / 'manifest' / runtime['manifest_id']
+    selection_provenance = collect_provenance(policy=resolved['provenance'], require_clean=False)
+    adapter = sl.ActivityNetAdapter(dataset_root=dataset_root)
+    full_sources, selection = full_sources_and_selection(
+        adapter, resolved, selection_provenance['sequential_loader'],
+    )
+    manifest_id = runtime['manifest_id']
+    if selection.identity['strategy'] != ALL_SOURCES_STRATEGY and manifest_id == resolved['linear_probe']['id']:
+        manifest_id = f'{manifest_id}__sel-{selection.selection_sha256[:12]}'
+        validate_path_component('resolved manifest_id', manifest_id)
+    manifest_dir = output_root / 'manifest' / manifest_id
     rows, _, manifest_metadata = manifest.load_manifest(manifest_dir)
     manifest_science = science_contract(cfg, MANIFEST_SCIENCE_GROUPS)
     if (manifest_metadata.get('science') or {}).get('sha256') != manifest_science['sha256']:
         raise RuntimeError('Manifest was built with a different dataset/stream configuration')
     science = feature_science_contract(cfg)
     production = manifest_metadata['production'] and science['canonical']
-    provenance = collect_provenance(policy=resolved['provenance'], require_clean=production)
-    adapter = sl.ActivityNetAdapter(dataset_root=dataset_root)
+    provenance = (
+        collect_provenance(policy=resolved['provenance'], require_clean=True)
+        if production else selection_provenance
+    )
     sources_by_split, dataset_identity = dataset_sources_and_identity(
-        adapter, manifest_metadata, resolved['activitynet']['expected_source_counts'],
+        full_sources, selection, manifest_metadata, resolved['activitynet']['expected_source_counts'],
     )
     if manifest_metadata['frames_per_chunk'] != resolved['sequential']['frames_per_chunk']:
         raise RuntimeError('Manifest frames_per_chunk differs from the resolved stream config')
@@ -176,9 +241,13 @@ def run(cfg):
     preprocessing = preprocessing_identity(
         processor, checkpoint_id, resolved['sequential']['frames_per_chunk'],
     )
+    expected_protocol_version = (
+        resolved['moco']['protocol_version'] if selection.identity['strategy'] == ALL_SOURCES_STRATEGY
+        else 'activitynet-selected-single-pass-streaming-moco/v1'
+    )
     encoder, encoder_info = build_encoder(
         runtime['condition'], snapshot, manifest_metadata, resolved['encoder'], production,
-        resolved['activitynet']['expected_source_counts']['training'],
+        len(sources_by_split['training']), expected_protocol_version,
     )
     feature_definition = {
         **resolved['linear_probe']['feature_definition'], 'size': resolved['encoder']['feature_size'],
@@ -194,6 +263,9 @@ def run(cfg):
         'extraction_provenance': extraction_provenance(provenance),
         'science': science,
     }
+    if manifest_metadata.get('selection_sha256') is not None:
+        shared_contract['source_selection'] = manifest_metadata['source_selection']
+        shared_contract['selection_sha256'] = manifest_metadata['selection_sha256']
     shared_contract_sha = sha256_bytes(canonical_json_bytes(shared_contract))
     encoder_sha = sha256_bytes(canonical_json_bytes(encoder_info))
     feature_identity_sha = sha256_bytes(canonical_json_bytes({
@@ -204,6 +276,7 @@ def run(cfg):
     directory = output_root / 'features' / runtime['condition'] / feature_id
     inputs = {
         'condition': runtime['condition'], 'feature_id': feature_id, 'production': production,
+        'selection_sha256': manifest_metadata.get('selection_sha256'),
         'manifest': {key: manifest_metadata[key] for key in (
             'manifest_id', 'segment_manifest_sha256', 'label_mapping_sha256')},
         'encoder': encoder_info, 'encoder_sha256': encoder_sha,
@@ -257,6 +330,7 @@ def run(cfg):
     status = log_artifact(experiment, directory, 'metadata.json', artifact_name, 'dataset',
                           metadata['files'], {'feature_id': feature_id, 'condition': runtime['condition'],
                                               'segment_manifest_sha256': manifest_metadata['segment_manifest_sha256'],
+                                              'selection_sha256': manifest_metadata.get('selection_sha256'),
                                               'encoder_sha256': encoder_sha,
                                               'shared_feature_contract_sha256': shared_contract_sha},
                           aliases=(feature_id,), project_name=resolved['tracking']['comet_project'])

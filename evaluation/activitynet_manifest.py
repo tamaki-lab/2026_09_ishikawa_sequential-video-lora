@@ -13,8 +13,9 @@ from pathlib import Path
 
 import torch
 
+from integration.activitynet_source_selection import validate_selection_record
 from integration.sequential_stream import ordered_samples
-from utils.artifact_io import canonical_json_bytes, read_json, sha256_file, write_bytes_atomic
+from utils.artifact_io import canonical_json_bytes, read_json, sha256_bytes, sha256_file, write_bytes_atomic
 from utils.artifact_io import write_json_atomic
 from utils.configuration import load_config_group
 
@@ -214,6 +215,23 @@ def load_manifest(directory, require_gate=True):
         raise RuntimeError(f'Manifest Integrity Gate has not passed: {metadata["gate"]["status"]}')
     if require_gate and metadata['production'] != (metadata['gate']['status'] == 'PASS'):
         raise RuntimeError('Manifest production flag and Gate status disagree')
+    selection = metadata.get('source_selection')
+    selection_sha = metadata.get('selection_sha256')
+    if (selection is None) != (selection_sha is None):
+        raise RuntimeError('Manifest source-selection metadata is incomplete')
+    if selection is not None:
+        if sha256_bytes(canonical_json_bytes(selection)) != selection_sha:
+            raise RuntimeError('Manifest source-selection SHA-256 is invalid')
+        validate_selection_record(metadata)
+        for split in SPLITS:
+            selected = selection['splits'][split]
+            recorded = metadata['splits'][split]
+            if (
+                selected['selected_source_count'] != recorded['used_source_count']
+                or selected['selected_ordered_source_sha256'] != recorded['ordered_used_source_sha256']
+                or selected['ordered_selected_ids'] != recorded.get('ordered_used_source_ids')
+            ):
+                raise RuntimeError(f'Manifest {split} source selection differs from split metadata')
     mapping = read_json(directory / MAPPING_FILE)
     rows = [json.loads(line) for line in (directory / MANIFEST_FILE).read_text(encoding='utf-8').splitlines()]
     return rows, mapping, metadata
