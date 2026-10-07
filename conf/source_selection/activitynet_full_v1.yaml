@@ -1,0 +1,8 @@
+id: activitynet-full-v1
+strategy: all_sources
+selection_seed: null
+splits:
+  training:
+    count: 10024
+  validation:
+    count: 4926

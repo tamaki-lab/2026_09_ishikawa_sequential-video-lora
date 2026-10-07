@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from training.moco_protocol import StreamingMoCoProtocol
+from integration.activitynet_source_selection import SourceSelectionConfig, approved_profile_name
 from utils.configuration import load_config_group, validate_path_component
 
 
@@ -214,6 +215,7 @@ class RuntimeConfig:
 @dataclass(frozen=True)
 class FullMoCoConfig:
     activitynet: ActivityNetConfig
+    source_selection: SourceSelectionConfig
     encoder: EncoderConfig
     sequential: SequentialConfig
     moco: MoCoConfig
@@ -236,6 +238,9 @@ class FullMoCoConfig:
             raise ValueError('tracking.artifacts.moco_snapshot must be a non-empty string')
         return cls(
             activitynet=ActivityNetConfig.from_mapping(value['activitynet']),
+            source_selection=SourceSelectionConfig.from_mapping(
+                value['source_selection'], value['activitynet']['expected_source_counts'],
+            ),
             encoder=EncoderConfig.from_mapping(value['encoder']), sequential=sequential,
             moco=MoCoConfig.from_mapping(
                 value['moco'], round_robin_stream_count=sequential.round_robin_stream_count,
@@ -250,6 +255,9 @@ class FullMoCoConfig:
         canonical_sequential = SequentialConfig.from_mapping(load_config_group('sequential', 'default'))
         return (
             self.activitynet == ActivityNetConfig.from_mapping(load_config_group('activitynet', 'v1_3'))
+            and approved_profile_name(
+                self.source_selection.metadata(), self.activitynet.expected_source_counts,
+            ) is not None
             and self.encoder == EncoderConfig.from_mapping(load_config_group('encoder', 'vit_base_patch16_224'))
             and self.sequential == canonical_sequential
             and self.moco == MoCoConfig.from_mapping(
@@ -258,6 +266,11 @@ class FullMoCoConfig:
             )
             and self.provenance == load_config_group('provenance', 'research_v1')
         )
+
+    def effective_protocol_identity(self):
+        if self.source_selection.strategy == 'all_sources':
+            return self.moco.name, self.moco.protocol_version
+        return 'stage6b_subset_v1', 'activitynet-selected-single-pass-streaming-moco/v1'
 
 
 def canonical_activitynet_config():

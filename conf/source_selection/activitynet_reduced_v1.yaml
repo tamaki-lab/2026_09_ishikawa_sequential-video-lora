@@ -1,0 +1,8 @@
+id: activitynet-reduced-v1
+strategy: sha256_rank_preserve_adapter_order_v1
+selection_seed: 0
+splits:
+  training:
+    count: 1000
+  validation:
+    count: 1000

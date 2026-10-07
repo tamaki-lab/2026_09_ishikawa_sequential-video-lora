@@ -80,6 +80,9 @@ def test_pipeline_roots_compose_shared_science_defaults(config_name):
         "training": 10_024,
         "validation": 4_926,
     }
+    assert cfg.source_selection.id == 'activitynet-full-v1'
+    assert cfg.source_selection.strategy == 'all_sources'
+    assert cfg.source_selection.selection_seed is None
     assert cfg.encoder.checkpoint_id == "google/vit-base-patch16-224"
     assert cfg.encoder.feature_size == 768
     assert cfg.encoder.lora.target_modules == ["q_proj", "v_proj"]
@@ -263,6 +266,17 @@ def test_moco_production_match_excludes_tracking_but_includes_science():
     changed = FullMoCoConfig.from_mapping(plain_config(compose_pipeline('moco_full', (
         *required, 'moco.optimizer.lr=0.002',
     ))))
+    reduced = FullMoCoConfig.from_mapping(plain_config(compose_pipeline('moco_full', (
+        *required, 'source_selection=activitynet_reduced_v1',
+    ))))
+    arbitrary = FullMoCoConfig.from_mapping(plain_config(compose_pipeline('moco_full', (
+        *required, 'source_selection=activitynet_reduced_v1', 'source_selection.selection_seed=1',
+    ))))
     assert canonical.production_groups_match() is True
     assert tracking.production_groups_match() is True
     assert changed.production_groups_match() is False
+    assert reduced.production_groups_match() is True
+    assert reduced.effective_protocol_identity() == (
+        'stage6b_subset_v1', 'activitynet-selected-single-pass-streaming-moco/v1',
+    )
+    assert arbitrary.production_groups_match() is False

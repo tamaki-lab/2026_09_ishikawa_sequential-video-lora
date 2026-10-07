@@ -1,5 +1,6 @@
 defaults:
   - activitynet: v1_3
+  - source_selection: activitynet_full_v1
   - encoder: vit_base_patch16_224
   - sequential: default
   - moco: stage6b_v2
