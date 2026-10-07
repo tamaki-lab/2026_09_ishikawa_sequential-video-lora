@@ -4,7 +4,7 @@ set -Eeuo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  bash run_full_pipeline.sh <activitynet_root> <run_id> <moco_seed> [gpu_id] [moco_mode]
+  bash run_full_pipeline.sh <activitynet_root> <run_id> <moco_seed> [gpu_id] [moco_mode] [source_selection_profile]
 
 Arguments:
   activitynet_root  ActivityNet v1.3 dataset root
@@ -12,9 +12,11 @@ Arguments:
   moco_seed         MoCo initialization seed in [0, 2**32)
   gpu_id            CUDA_VISIBLE_DEVICES value for the single GPU (default: 0)
   moco_mode         fresh | resume | skip (default: fresh)
+  source_selection_profile
+                    Hydra source-selection profile (default: activitynet_full_v1)
 
 Modes:
-  fresh   Start a new full-dataset MoCo run.
+  fresh   Start a new selected-source MoCo run.
   resume  Resume from log/moco/<run_id>/resume/latest.pt.
   skip    Skip MoCo and use an already completed final snapshot.
 
@@ -55,7 +57,7 @@ die() {
   exit 1
 }
 
-[[ $# -ge 3 && $# -le 5 ]] || {
+[[ $# -ge 3 && $# -le 6 ]] || {
   usage
   exit 2
 }
@@ -65,13 +67,13 @@ RUN_ID="$2"
 MOCO_SEED="$3"
 GPU_ID="${4:-0}"
 MOCO_MODE="${5:-fresh}"
+SOURCE_SELECTION_PROFILE="${6:-activitynet_full_v1}"
 
 PYTHON="${PYTHON:-.venv/bin/python}"
 FEATURE_DEVICE="${FEATURE_DEVICE:-cuda}"
 PROBE_DEVICE="${PROBE_DEVICE:-cpu}"
 DISABLE_COMET="${DISABLE_COMET:-false}"
 
-MANIFEST_ID="lp-v1"
 EXPECTED_BRANCH="dev"
 
 [[ -d "$DATASET_ROOT" ]] || die "ActivityNet root does not exist: $DATASET_ROOT"
@@ -81,6 +83,8 @@ EXPECTED_BRANCH="dev"
 [[ "$GPU_ID" =~ ^[0-9]+$ ]] || die "gpu_id must identify exactly one GPU, e.g. 0"
 [[ "$MOCO_MODE" == "fresh" || "$MOCO_MODE" == "resume" || "$MOCO_MODE" == "skip" ]] \
   || die "moco_mode must be fresh, resume, or skip"
+[[ "$SOURCE_SELECTION_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+  || die "Invalid source_selection_profile: $SOURCE_SELECTION_PROFILE"
 [[ "$FEATURE_DEVICE" == "cuda" || "$FEATURE_DEVICE" == "cpu" ]] \
   || die "FEATURE_DEVICE must be cuda or cpu"
 [[ "$PROBE_DEVICE" == "cuda" || "$PROBE_DEVICE" == "cpu" ]] \
@@ -93,6 +97,8 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" \
 cd "$REPO_ROOT"
 
 [[ -x "$PYTHON" ]] || die "Python executable is not executable: $PYTHON"
+[[ -f "conf/source_selection/${SOURCE_SELECTION_PROFILE}.yaml" ]] \
+  || die "Unknown source-selection profile: $SOURCE_SELECTION_PROFILE"
 
 CURRENT_BRANCH="$(git branch --show-current)"
 [[ "$CURRENT_BRANCH" == "$EXPECTED_BRANCH" ]] \
@@ -111,7 +117,6 @@ export PYTHONDONTWRITEBYTECODE=1
 
 PIPELINE_LOG_DIR="log/full_pipeline/${RUN_ID}"
 MOCO_RUN_DIR="log/moco/${RUN_ID}"
-MANIFEST_DIR="log/linear_probe/manifest/${MANIFEST_ID}"
 mkdir -p "$PIPELINE_LOG_DIR"
 
 echo "============================================================"
@@ -124,6 +129,7 @@ echo "run_id     : $RUN_ID"
 echo "moco_seed  : $MOCO_SEED"
 echo "gpu_id     : $GPU_ID"
 echo "moco_mode  : $MOCO_MODE"
+echo "selection  : $SOURCE_SELECTION_PROFILE"
 echo "Comet      : $([[ "$DISABLE_COMET" == "false" ]] && echo enabled || echo disabled)"
 echo "============================================================"
 
@@ -134,7 +140,7 @@ run_logged() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Full-dataset Stage 6B-v2 Streaming MoCo
+# 1. Stage 6B Streaming MoCo over the selected training sources
 # ---------------------------------------------------------------------------
 case "$MOCO_MODE" in
   fresh)
@@ -146,6 +152,7 @@ case "$MOCO_MODE" in
       "runtime.dataset_root=$DATASET_ROOT" \
       "runtime.run_id=$RUN_ID" \
       "runtime.seed=$MOCO_SEED" \
+      "source_selection=$SOURCE_SELECTION_PROFILE" \
       runtime.device=cuda \
       runtime.resume=false \
       "logging.disable_comet=$DISABLE_COMET"
@@ -160,6 +167,7 @@ case "$MOCO_MODE" in
       "runtime.dataset_root=$DATASET_ROOT" \
       "runtime.run_id=$RUN_ID" \
       "runtime.seed=$MOCO_SEED" \
+      "source_selection=$SOURCE_SELECTION_PROFILE" \
       runtime.device=cuda \
       runtime.resume=true \
       "logging.disable_comet=$DISABLE_COMET"
@@ -191,6 +199,38 @@ PY
 
 echo "[1/5] Final Query LoRA snapshot: $FINAL_SNAPSHOT"
 
+# Rebuild and verify the exact source selection before any downstream artifact
+# is opened. Legacy full snapshots remain valid only with the full profile.
+MANIFEST_ID="$(
+  "$PYTHON" - "$DATASET_ROOT" "$FINAL_SNAPSHOT/metadata.json" "$SOURCE_SELECTION_PROFILE" <<'PY'
+from pathlib import Path
+import sys
+
+from integration.activitynet_source_selection import SourceSelectionConfig
+from scripts.linear_probe.build_manifest import resolve_snapshot_manifest_id
+from utils.artifact_io import read_json
+from utils.configuration import load_config_group
+from utils.provenance import collect_provenance
+
+dataset_root = Path(sys.argv[1])
+metadata = read_json(sys.argv[2])
+activitynet = load_config_group('activitynet', 'v1_3')
+profile = load_config_group('source_selection', sys.argv[3])
+config = SourceSelectionConfig.from_mapping(
+    profile, activitynet['expected_source_counts'],
+)
+provenance = collect_provenance(
+    policy=load_config_group('provenance', 'research_v1'), require_clean=True,
+)
+protocol = load_config_group('linear_probe', 'lp_v1')['id']
+print(resolve_snapshot_manifest_id(
+    dataset_root, metadata, activitynet, config, provenance, protocol,
+))
+PY
+)"
+MANIFEST_DIR="log/linear_probe/manifest/${MANIFEST_ID}"
+echo "[1/5] Manifest identity: $MANIFEST_ID"
+
 # ---------------------------------------------------------------------------
 # 2. ActivityNet segment manifest + reproducibility audit
 # ---------------------------------------------------------------------------
@@ -200,6 +240,7 @@ if [[ ! -d "$MANIFEST_DIR" ]]; then
     runtime.command=build \
     "runtime.dataset_root=$DATASET_ROOT" \
     "runtime.manifest_id=$MANIFEST_ID" \
+    "source_selection=$SOURCE_SELECTION_PROFILE" \
     "logging.disable_comet=$DISABLE_COMET"
 else
   echo "[2/5] Existing manifest found; build is skipped and audit will verify it: $MANIFEST_DIR"
@@ -210,6 +251,7 @@ run_logged "$PIPELINE_LOG_DIR/02_manifest_audit.log" \
   runtime.command=audit \
   "runtime.dataset_root=$DATASET_ROOT" \
   "runtime.manifest_id=$MANIFEST_ID" \
+  "source_selection=$SOURCE_SELECTION_PROFILE" \
   "logging.disable_comet=$DISABLE_COMET"
 
 "$PYTHON" - "$MANIFEST_DIR/metadata.json" <<'PY'
@@ -238,6 +280,7 @@ extract_feature_dir() {
     "$PYTHON" -m scripts.linear_probe.extract_features
     "runtime.dataset_root=$DATASET_ROOT"
     "runtime.manifest_id=$MANIFEST_ID"
+    "source_selection=$SOURCE_SELECTION_PROFILE"
     "runtime.condition=$condition"
     "runtime.device=$FEATURE_DEVICE"
     "logging.disable_comet=$DISABLE_COMET"
@@ -289,6 +332,7 @@ PROBE_LOG="$PIPELINE_LOG_DIR/04_linear_probe.log"
 run_logged "$PROBE_LOG" \
   "$PYTHON" -m scripts.linear_probe.run_probe \
   "runtime.manifest_id=$MANIFEST_ID" \
+  "source_selection=$SOURCE_SELECTION_PROFILE" \
   "runtime.base_features=$BASE_FEATURE_DIR" \
   "runtime.lora_features=$LORA_FEATURE_DIR" \
   "runtime.device=$PROBE_DEVICE" \
