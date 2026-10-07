@@ -183,8 +183,11 @@ def test_video_boundary_resume_is_exact(small, videos, tmp_path):
     reference_optimizer = checkpoint.load_resume_checkpoint(tmp_path / 'reference' / 'resume' / 'latest.pt')
 
     first = small(seed=1)
+    snapshot_count = len(small.snapshots)
     paused = run(first, sources, tmp_path / 'resumed', run_id='x', stop_after_videos=2)
     assert paused['status'] == 'paused' and paused['processed_videos'] == 2 and paused['next_source_id'] == 'c'
+    assert len(small.snapshots) == snapshot_count
+    assert not events(tmp_path / 'resumed', 'evaluation_snapshot')
     del first
     # A newly constructed process state; perturbed trainable / EMA tensors must be overwritten.
     second = small(seed=1)
@@ -209,6 +212,35 @@ def test_video_boundary_resume_is_exact(small, videos, tmp_path):
     assert [(row['sequence_id'], row['sequence_index']) for row in resumed_steps] == [
         ('a', 1), ('a', 2), ('b', 0), ('c', 0), ('c', 1), ('d', 0), ('d', 1), ('d', 2)]
     assert len(events(tmp_path / 'resumed', 'warmup')) == 1
+
+
+def test_stop_after_at_or_beyond_selected_count_finishes_at_source_exhaustion(
+    small, videos, tmp_path,
+):
+    videos['lengths'] = {'a': 2, 'b': 2}
+    selection_record = {
+        'schema': 'activitynet-source-selection/v1',
+        'created': '2026-10-08T00:00:00Z',
+        'implementation': PROVENANCE['implementation'],
+    }
+    config = {
+        **CONFIG,
+        'source_selection': {'profile_id': 'test-reduced-v1'},
+        'selection_sha256': 'a' * 64,
+        'selection_record': selection_record,
+    }
+    result = run(
+        small(), make_sources(videos['lengths']), tmp_path / 'run',
+        stop_after_videos=99, run_config=config,
+    )
+    assert result['status'] == 'complete'
+    assert result['processed_videos'] == 2 and result['next_video_index'] == 2
+    assert result['next_source_id'] is None and result['final'] is True
+    assert not events(tmp_path / 'run', 'paused')
+    assert [(row['processed_videos'], row['final']) for row in events(
+        tmp_path / 'run', 'evaluation_snapshot',
+    )] == [(2, True)]
+    assert small.snapshot_metadata[-1]['selection_record'] == selection_record
 
 
 def test_resume_rejects_mismatch_corruption_mid_video_and_final(small, videos, tmp_path):
@@ -252,6 +284,32 @@ def test_resume_rejects_mismatch_corruption_mid_video_and_final(small, videos, t
     assert run(small(), sources, tmp_path / 'run', resume=True)['final']
     with pytest.raises(RuntimeError, match='already completed'):
         run(small(), sources, tmp_path / 'run', resume=True)
+
+
+@pytest.mark.parametrize('field, value', [
+    ('profile_id', 'other-profile'),
+    ('strategy', 'other-strategy'),
+    ('selection_seed', 9),
+    ('selection_sha256', 'b' * 64),
+])
+def test_resume_rejects_source_selection_mismatch(small, videos, tmp_path, field, value):
+    videos['lengths'] = {'a': 2, 'b': 2}
+    sources = make_sources(videos['lengths'])
+    source_selection = {
+        'profile_id': 'test-reduced-v1', 'strategy': 'sha256_rank_preserve_adapter_order_v1',
+        'selection_seed': 7,
+    }
+    config = {
+        **CONFIG, 'selection_sha256': 'a' * 64, 'source_selection': source_selection,
+    }
+    run(small(), sources, tmp_path / 'run', stop_after_videos=1, run_config=config)
+    changed = dict(config)
+    if field == 'selection_sha256':
+        changed[field] = value
+    else:
+        changed['source_selection'] = {**source_selection, field: value}
+    with pytest.raises(RuntimeError, match='source_selection'):
+        run(small(), sources, tmp_path / 'run', resume=True, run_config=changed)
 
 
 def test_dirty_full_run_is_rejected_before_creating_output(small, videos, tmp_path):

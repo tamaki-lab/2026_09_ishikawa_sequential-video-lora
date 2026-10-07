@@ -132,6 +132,14 @@ def run_identity(
         'optimizer_config': optimizer_config(optimizer), 'seed': run_config['seed'],
         'device_identity': runtime_device,
         'source_count': len(source_ids), 'ordered_source_sha256': ordered_source_sha256(source_ids),
+        'source_selection': {
+            'selection_sha256': run_config.get('selection_sha256'),
+            'profile_id': (run_config.get('source_selection') or {}).get('profile_id'),
+            'strategy': (run_config.get('source_selection') or {}).get('strategy'),
+            'selection_seed': (run_config.get('source_selection') or {}).get('selection_seed'),
+            'selected_source_count': len(source_ids),
+            'selected_ordered_source_sha256': ordered_source_sha256(source_ids),
+        },
     }
 
 
@@ -176,7 +184,7 @@ def run_full_streaming_moco(
     moco_settings = _MOCO_CONFIG if config is None else config.moco
     sequential_settings = _SEQUENTIAL_CONFIG if config is None else config.sequential
     protocol = moco_settings.protocol
-    protocol_version = moco_settings.protocol_version
+    protocol_version = run_config.get('protocol_version', moco_settings.protocol_version)
     optimizer_settings = moco_settings.optimizer
     production_config = True if config is None else config.production_groups_match()
     snapshot_artifact = SNAPSHOT_ARTIFACT if config is None else config.tracking['artifacts']['moco_snapshot']
@@ -192,7 +200,7 @@ def run_full_streaming_moco(
             raise RuntimeError('Resolved encoder/MoCo config differs from the constructed model')
     expected_source_count = (
         ACTIVITYNET_TRAINING_COUNT if expected_source_count is None and config is None
-        else config.activitynet.expected_source_counts['training'] if expected_source_count is None
+        else config.source_selection.counts['training'] if expected_source_count is None
         else expected_source_count
     )
     resume_interval = moco_settings.intervals.resume_videos if resume_interval is None else resume_interval
@@ -291,6 +299,9 @@ def run_full_streaming_moco(
             'seed': run_config['seed'], 'device_identity': runtime_device,
             'moco_experiment_key': None if experiment is None else experiment.get_key(),
             'production_config': production_config,
+            'source_selection': run_config.get('source_selection'),
+            'selection_sha256': run_config.get('selection_sha256'),
+            'selection_record': run_config.get('selection_record'),
             'created': utc_now(),
         }
 
@@ -302,8 +313,10 @@ def run_full_streaming_moco(
                 [f'run-{run_id}-final'] if final else [])
             log_artifact(experiment, target, 'metadata.json', snapshot_artifact, 'model',
                          {file: metadata['files'][file] for file in SNAPSHOT_FILES},
-                         {key: metadata[key] for key in ('run_id', 'processed_videos', 'global_update_step', 'final',
-                                                         'protocol_version')}, aliases,
+                         {key: metadata.get(key) for key in (
+                             'run_id', 'processed_videos', 'global_update_step', 'final',
+                             'protocol_version', 'selection_sha256',
+                         )}, aliases,
                          project_name=(
                              _TRACKING_CONFIG['comet_project'] if config is None
                              else config.tracking['comet_project']
@@ -338,6 +351,9 @@ def run_full_streaming_moco(
                 'config': run_config, 'provenance': provenance, 'source_count': len(source_ids),
                 'ordered_source_sha256': ordered_source_sha256(source_ids),
                 'production_config': production_config,
+                'source_selection': run_config.get('source_selection'),
+                'selection_sha256': run_config.get('selection_sha256'),
+                'selection_record': run_config.get('selection_record'),
                 'moco_experiment_key': None if experiment is None else experiment.get_key(),
             })
             recorder.event('start', **counters)

@@ -20,6 +20,7 @@ import torch
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
 from safetensors.torch import load_file
 
+from integration.activitynet_source_selection import validate_selection_record
 from self_supervised.moco.vit_lora_moco import lora_parameters
 from training.moco_config import (
     canonical_activitynet_config, canonical_encoder_config, canonical_moco_config, canonical_sequential_config,
@@ -43,7 +44,7 @@ RESUME_IDENTITY = (
     'dependencies', 'dataset', 'stream_config', 'base_model', 'base_fingerprints', 'lora_config',
     'feature_size', 'projection_size', 'queue_capacity', 'momentum', 'temperature',
     'optimizer_config', 'seed', 'device_identity',
-    'source_count', 'ordered_source_sha256',
+    'source_count', 'ordered_source_sha256', 'source_selection',
 )
 
 
@@ -101,7 +102,7 @@ def encoder_base_fingerprint(encoder):
 
 def validate_production_snapshot_metadata(
     metadata, *, expected_source_sha256, expected_base_fingerprint, expected_dataset_root=None,
-    expected_source_count=None,
+    expected_source_count=None, expected_selection=None, expected_protocol_version=None,
 ):
     """Reject a snapshot that is not the unique final Stage 6B production artifact.
 
@@ -110,6 +111,8 @@ def validate_production_snapshot_metadata(
     """
     if expected_source_count is None:
         expected_source_count = _ACTIVITYNET_CONFIG.expected_source_counts['training']
+    if expected_protocol_version is None:
+        expected_protocol_version = PROTOCOL_VERSION
     dataset = metadata.get('dataset') or {}
     implementation = metadata.get('implementation') or {}
     loader = metadata.get('sequential_loader') or {}
@@ -128,7 +131,7 @@ def validate_production_snapshot_metadata(
         # non-canonical Hydra overrides record False and must never pass the
         # production gate.
         'production_config': metadata.get('production_config', True) is True,
-        'protocol_version': metadata.get('protocol_version') == PROTOCOL_VERSION,
+        'protocol_version': metadata.get('protocol_version') == expected_protocol_version,
         'final': metadata.get('final') is True,
         'processed_videos': metadata.get('processed_videos') == expected_source_count,
         'global_update_step': type(metadata.get('global_update_step')) is int
@@ -175,6 +178,11 @@ def validate_production_snapshot_metadata(
             list(_MOCO_CONFIG.optimizer.betas), _MOCO_CONFIG.optimizer.eps,
         ),
     }
+    if expected_selection is not None:
+        checks.update({
+            'selection_sha256': metadata.get('selection_sha256') == expected_selection.get('selection_sha256'),
+            'source_selection': metadata.get('source_selection') == expected_selection.get('source_selection'),
+        })
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise RuntimeError(f'Production Query LoRA snapshot contract mismatch: {failed}')
@@ -392,6 +400,14 @@ def load_query_lora_snapshot(encoder, snapshot):
     metadata = read_json(snapshot / 'metadata.json')
     if metadata.get('schema') != SNAPSHOT_SCHEMA:
         raise RuntimeError(f'Unsupported Query LoRA snapshot schema: {metadata.get("schema")}')
+    selection = metadata.get('source_selection')
+    selection_sha = metadata.get('selection_sha256')
+    if (selection is None) != (selection_sha is None):
+        raise RuntimeError('Query LoRA snapshot source-selection metadata is incomplete')
+    if selection is not None and sha256_bytes(canonical_json_bytes(selection)) != selection_sha:
+        raise RuntimeError('Query LoRA snapshot source-selection SHA-256 is invalid')
+    if selection is not None:
+        validate_selection_record(metadata)
     actual = {file: sha256_file(snapshot / file) for file in SNAPSHOT_FILES}
     if actual != metadata['files']:
         raise RuntimeError('Query LoRA snapshot files do not match metadata hashes')

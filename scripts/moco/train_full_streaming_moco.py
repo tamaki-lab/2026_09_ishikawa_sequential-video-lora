@@ -20,15 +20,16 @@ import sequential_loader as sl
 import torch
 from transformers import AutoImageProcessor
 
+from integration.activitynet_source_selection import select_activitynet_sources
 from logger.comet_lineage import display_tag, end_experiment, scope_tag, start_experiment
 from model.backbones.vit import ViTLoRAFrameEncoder
 from self_supervised.moco import ViTLoRAMoCo
 from training.moco_checkpoint import seed_all
 from training.moco_config import FullMoCoConfig
 from training import streaming_moco_full as full
-from utils.artifact_io import read_json, write_json_atomic
+from utils.artifact_io import read_json, sha256_file, write_json_atomic
 from utils.configuration import plain_config
-from utils.provenance import collect_provenance, device_identity
+from utils.provenance import collect_provenance, device_identity, utc_now
 
 
 def run(cfg):
@@ -39,6 +40,7 @@ def run(cfg):
         raise RuntimeError('CUDA is not available')
 
     production_config = settings.production_groups_match()
+    protocol_name, protocol_version = settings.effective_protocol_identity()
     seed_all(runtime.seed)
     provenance = {
         **collect_provenance(policy=settings.provenance, require_clean=production_config),
@@ -50,7 +52,7 @@ def run(cfg):
     run_dir = runtime.output_root / runtime.run_id
     protocol = settings.moco.protocol
     run_config = {
-        'run_id': runtime.run_id, 'protocol_version': settings.moco.protocol_version,
+        'run_id': runtime.run_id, 'protocol_version': protocol_version,
         'resume': runtime.resume, 'seed': runtime.seed,
         'dataset': {'name': settings.activitynet.name, 'version': settings.activitynet.version,
                     'split': settings.activitynet.splits['training']},
@@ -62,7 +64,8 @@ def run(cfg):
         'intervals': {'resume_videos': settings.moco.intervals.resume_videos,
                       'snapshot_videos': settings.moco.intervals.snapshot_videos,
                       'comet_metric_updates': settings.moco.intervals.comet_metric_updates},
-        'expected_source_count': settings.activitynet.expected_source_counts['training'],
+        'expected_full_source_count': settings.activitynet.expected_source_counts['training'],
+        'expected_source_count': settings.source_selection.counts['training'],
         'frames_per_chunk': settings.sequential.frames_per_chunk,
         'round_robin_stream_count': settings.sequential.round_robin_stream_count,
         'production_config': production_config,
@@ -72,21 +75,55 @@ def run(cfg):
         'device_identity': runtime_device,
         'locations': {'dataset_root': str(dataset_root), 'run_dir': str(run_dir.resolve())},
     }
+    adapter = sl.ActivityNetAdapter(dataset_root=dataset_root)
+    full_sources = {
+        split: tuple(adapter.sequence_sources(adapter_split))
+        for split, adapter_split in settings.activitynet.splits.items()
+    }
+    for split, sources in full_sources.items():
+        full.validate_full_sources(sources, settings.activitynet.expected_source_counts[split])
+    annotation_paths = {
+        source.evaluation_reference.annotation_path
+        for sources in full_sources.values() for source in sources
+    }
+    annotation_hashes = {sha256_file(path) for path in annotation_paths}
+    if len(annotation_hashes) != 1:
+        raise RuntimeError('ActivityNet splits must use one identical annotation file')
+    selection = select_activitynet_sources(
+        full_sources, settings.source_selection,
+        expected_counts=settings.activitynet.expected_source_counts,
+        dataset={'name': settings.activitynet.name, 'version': settings.activitynet.version},
+        sequential_loader=provenance['sequential_loader'],
+        annotation_sha256=next(iter(annotation_hashes)),
+    )
+    sources = selection.sources['training']
+    run_config.update({
+        'source_selection': selection.identity,
+        'selection_sha256': selection.selection_sha256,
+        'selection_record': {
+            'schema': selection.identity['schema'], 'created': utc_now(),
+            'implementation': provenance['implementation'],
+        },
+    })
+    logged_selection = {
+        **selection.identity,
+        'splits': {
+            split: {key: value for key, value in identity.items() if key != 'ordered_selected_ids'}
+            for split, identity in selection.identity['splits'].items()
+        },
+    }
+    logged_run_config = {**run_config, 'source_selection': logged_selection}
     print('Resolved Hydra config:\n' + OmegaConf.to_yaml(cfg, resolve=True), flush=True)
-    print('Resolved run config: ' + json.dumps(run_config, sort_keys=True), flush=True)
+    print('Resolved run config: ' + json.dumps(logged_run_config, sort_keys=True), flush=True)
     print('Provenance: ' + json.dumps(provenance, sort_keys=True), flush=True)
-
-    split = settings.activitynet.splits['training']
-    sources = sl.ActivityNetAdapter(dataset_root=dataset_root).sequence_sources(split)
-    full.validate_full_sources(sources, settings.activitynet.expected_source_counts['training'])
     existing_key = None
     if runtime.resume:
         existing_key = read_json(run_dir / 'run_metadata.json').get('moco_experiment_key')
     # Tracking scope only: an explicit stop makes a canonical-config run a smoke run.
     production_run = production_config and runtime.stop_after_videos is None
-    protocol_tag = display_tag(settings.moco.name)
+    protocol_tag = display_tag(protocol_name)
     experiment, comet = start_experiment(
-        f'{protocol_tag}__moco__{runtime.run_id}', {'config': run_config, 'provenance': provenance},
+        f'{protocol_tag}__moco__{runtime.run_id}', {'config': logged_run_config, 'provenance': provenance},
         tags=('moco', scope_tag(production_run), protocol_tag, f'seed-{runtime.seed}'),
         disabled=settings.disable_comet, existing_key=existing_key,
         project_name=settings.tracking['comet_project'],

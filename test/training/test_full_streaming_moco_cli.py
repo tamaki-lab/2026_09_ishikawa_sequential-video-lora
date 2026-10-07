@@ -2,7 +2,8 @@
 
 import json
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 import sequential_loader as sl
@@ -18,13 +19,23 @@ CONFIG_ROOT = Path(__file__).resolve().parents[2] / 'conf'
 @pytest.fixture
 def cli(monkeypatch, tmp_path):
     events = []
-    sources = tuple(sl.SequenceSource(sequence_id=f'v{index}', source_id=f'v{index}', source=Path('x.mp4'),
-                                      start_frame=0, stop_frame=None) for index in range(10_024))
+    annotation = tmp_path / 'activity_net.v1-3.min.json'
+    annotation.write_text('{}')
+
+    def make_sources(split, count):
+        return tuple(sl.SequenceSource(
+            sequence_id=f'{split}-{index:05d}', source_id=f'{split}-{index:05d}', source=Path('x.mp4'),
+            start_frame=0, stop_frame=None,
+            evaluation_reference=SimpleNamespace(annotation_path=annotation),
+        ) for index in range(count))
+
+    by_split = {'training': make_sources('training', 10_024), 'validation': make_sources('validation', 4_926)}
     adapter = Mock()
-    adapter.sequence_sources.return_value = sources
+    adapter.sequence_sources.side_effect = lambda split: by_split[split]
     monkeypatch.setattr(sl, 'ActivityNetAdapter', Mock(return_value=adapter))
     provenance = Mock(return_value={
-        'implementation': {'dirty': False}, 'sequential_loader': {}, 'versions': {},
+        'implementation': {'dirty': False},
+        'sequential_loader': {'branch': 'ActivityNet', 'commit': 'loader'}, 'versions': {},
     })
     monkeypatch.setattr(cli_module, 'collect_provenance', provenance)
     monkeypatch.setattr(cli_module, 'seed_all', lambda seed: events.append(('seed', seed)))
@@ -44,22 +55,24 @@ def cli(monkeypatch, tmp_path):
                 'logging.disable_comet=true', f'runtime.output_root={tmp_path}', *overrides,
             ])
         cli_module.run(cfg)
-    return dict(invoke=invoke, run=run, adapter=adapter, sources=sources, root=tmp_path,
+    return dict(invoke=invoke, run=run, adapter=adapter, sources=by_split['training'], by_split=by_split, root=tmp_path,
                 events=events, provenance=provenance)
 
 
 def test_fresh_run_uses_all_training_sources_in_adapter_order(cli, capsys):
     cli['invoke']('runtime.run_id=run1', 'runtime.stop_after_videos=2')
-    cli['adapter'].sequence_sources.assert_called_once_with('training')
-    call = cli['run'].call_args
-    assert call.args[2] == cli['sources'] and call.args[4] == cli['root'] / 'run1'
-    assert call.kwargs['resume'] is False and call.kwargs['stop_after_videos'] == 2
-    assert call.kwargs['experiment'] is None and call.kwargs['run_id'] == 'run1'
+    assert cli['adapter'].sequence_sources.call_args_list == [call('training'), call('validation')]
+    run_call = cli['run'].call_args
+    assert run_call.args[2] == cli['sources'] and run_call.args[4] == cli['root'] / 'run1'
+    assert run_call.kwargs['resume'] is False and run_call.kwargs['stop_after_videos'] == 2
+    assert run_call.kwargs['experiment'] is None and run_call.kwargs['run_id'] == 'run1'
     config = json.loads(capsys.readouterr().out.split('Resolved run config: ')[1].splitlines()[0])
     assert config['protocol'] == {'stream_mode': 'strict_single', 'key_transform': 'gbr_horizontal_flip',
                                   'negative_policy': 'all_past'}
     assert config['intervals'] == {'resume_videos': 100, 'snapshot_videos': 1000, 'comet_metric_updates': 100}
     assert config['seed'] == 7 and config['device_identity'] == {'type': 'cpu'}
+    assert config['source_selection']['profile_id'] == 'activitynet-full-v1'
+    assert len(config['selection_sha256']) == 64
     assert cli['events'].index(('seed', 7)) < cli['events'].index(('model', None))
     assert cli['provenance'].call_args.kwargs['require_clean'] is True
     assert cli['provenance'].call_args.kwargs['policy']['repository'].startswith('tamaki-lab/')
@@ -102,6 +115,23 @@ def test_scientific_override_is_explicitly_nonproduction(cli):
     assert settings.production_groups_match() is False
 
 
+def test_reduced_profile_selects_adapter_order_and_separates_protocol(cli, monkeypatch, capsys):
+    start = Mock(return_value=(None, {'status': 'disabled'}))
+    monkeypatch.setattr(cli_module, 'start_experiment', start)
+    cli['invoke']('runtime.run_id=reduced', 'source_selection=activitynet_reduced_v1')
+    selected = cli['run'].call_args.args[2]
+    full_positions = {source.sequence_id: index for index, source in enumerate(cli['sources'])}
+    assert len(selected) == 1000
+    assert [full_positions[source.sequence_id] for source in selected] == sorted(
+        full_positions[source.sequence_id] for source in selected
+    )
+    assert start.call_args.args[0] == 'stage6b-subset-v1__moco__reduced'
+    assert start.call_args.kwargs['tags'] == ('moco', 'production', 'stage6b-subset-v1', 'seed-7')
+    config = json.loads(capsys.readouterr().out.split('Resolved run config: ')[1].splitlines()[0])
+    assert config['protocol_version'] == 'activitynet-selected-single-pass-streaming-moco/v1'
+    assert config['source_selection']['splits']['training']['selected_source_count'] == 1000
+
+
 @pytest.mark.parametrize('options', [
     ('runtime.run_id=../x',), ('runtime.run_id=a', 'runtime.stop_after_videos=0'),
     ('runtime.run_id=a', 'runtime.seed=-1'),
@@ -113,7 +143,7 @@ def test_invalid_options_stop_before_work(cli, options):
 
 
 def test_wrong_source_count_stops_before_model(cli):
-    cli['adapter'].sequence_sources.return_value = cli['sources'][:-1]
+    cli['by_split']['training'] = cli['sources'][:-1]
     with pytest.raises(ValueError, match='10024'):
         cli['invoke']('runtime.run_id=run1')
     cli_module.ViTLoRAMoCo.assert_not_called()
