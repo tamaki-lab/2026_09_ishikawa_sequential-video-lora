@@ -9,6 +9,7 @@ This does not use Sequential Loader, MoCo, the existing main.py, or Comet.
 """
 
 import json
+import subprocess
 from pathlib import Path
 
 import hydra
@@ -57,6 +58,22 @@ def load_adapter_head_checkpoint(path: Path, encoder, head, metadata: dict) -> N
     head.load_state_dict(checkpoint["classifier"], strict=True)
 
 
+def _git_provenance() -> dict:
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        revision = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        state = subprocess.run(
+            ["git", "-C", str(repository), "status", "--porcelain", "--untracked-files=all"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        return {"commit": revision, "dirty": bool(state.strip())}
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": "unavailable", "dirty": None}
+
+
 def run(cfg: DictConfig) -> dict:
     if cfg.data.name != "CIFAR10":
         raise ValueError("The standalone pilot supports CIFAR10 only")
@@ -96,6 +113,10 @@ def run(cfg: DictConfig) -> dict:
     )
     head_before = {k: v.detach().clone() for k, v in head.state_dict().items()}
     adapter_before = encoder.lora_state_dict()
+    base_before = {
+        name: value.detach().cpu().clone()
+        for name, value in encoder.vit.named_parameters() if not value.requires_grad
+    }
     # All pretrained parameters remain frozen. The optimizer contains only adapters + head.
     if any(p.requires_grad for name, p in encoder.vit.named_parameters()
            if ".lora_a." not in name and ".lora_b." not in name):
@@ -140,8 +161,11 @@ def run(cfg: DictConfig) -> dict:
 
     adapter_after = encoder.lora_state_dict()
     adapter_update = sum(float((v - adapter_before[k]).norm().item()) for k, v in adapter_after.items())
-    head_update = sum(float((v - head_before[k].cpu()).norm().item())
-                      for k, v in {name: p.detach().cpu() for name, p in head.state_dict().items()}.items())
+    head_update = sum(float((value.detach().cpu() - head_before[name].cpu()).norm().item())
+                      for name, value in head.state_dict().items())
+    if any(not torch.equal(parameter.detach().cpu(), base_before[name])
+           for name, parameter in encoder.vit.named_parameters() if not parameter.requires_grad):
+        raise RuntimeError("A frozen ViT parameter changed during training")
     if cfg.lora.enabled and adapter_update <= 0:
         raise RuntimeError("No adapter parameter changed during real-image training")
     if head_update <= 0:
@@ -177,6 +201,7 @@ def run(cfg: DictConfig) -> dict:
         "dataset": "CIFAR10 train",
         "dataset_indices": indices,
         "device": str(device),
+        "git": _git_provenance(),
         "steps": len(history),
         "trainable_parameters": sum(p.numel() for p in trainable),
         "adapter_update_norm_sum": adapter_update,
