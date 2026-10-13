@@ -1,0 +1,34 @@
+# Independent LoRA + CIFAR-10 sanity check; does not change conf/config.yaml.
+model:
+  checkpoint_id: google/vit-base-patch16-224
+
+lora:
+  enabled: true
+  target_modules: [q, v]  # any nonempty subset of [q, k, v]
+  rank: 8
+  alpha: 8
+  dropout: 0.0
+
+data:
+  name: CIFAR10
+  root: ./downloaded_data
+  download: false  # explicitly opt in before fetching dataset
+  train_subset_size: 64
+
+training:
+  seed: 0
+  batch_size: 16
+  max_steps: 20
+  optimizer: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0
+  device: cpu  # use device=cuda explicitly to occupy a GPU
+
+logging:
+  comet_enabled: false
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: log/lora_standalone/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
