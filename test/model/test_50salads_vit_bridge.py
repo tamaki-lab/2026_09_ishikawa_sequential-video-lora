@@ -3,7 +3,7 @@ import unittest
 import sequential_loader as sl
 import torch
 
-from smoke_50salads_vit_bridge import encode_chunk
+from integration.sequential_vit import encode_chunk
 
 
 class RecordingProcessor:
