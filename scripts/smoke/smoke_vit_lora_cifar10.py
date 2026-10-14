@@ -22,6 +22,11 @@ from torchvision.datasets import CIFAR10
 from transformers import AutoImageProcessor
 
 from model.vit import ViTLoRAFrameEncoder
+from scripts.smoke.lora_verification_reporting import (
+    changed_tensors, evaluate_checks, grad_norm_sum, update_norm_sum, write_verification_artifacts,
+)
+
+RELOAD_RTOL, RELOAD_ATOL = 1e-5, 1e-6
 
 
 def _image_transform(processor):
@@ -113,16 +118,25 @@ def run(cfg: DictConfig) -> dict:
     )
     head_before = {k: v.detach().clone() for k, v in head.state_dict().items()}
     adapter_before = encoder.lora_state_dict()
-    base_before = {
-        name: value.detach().cpu().clone()
-        for name, value in encoder.vit.named_parameters() if not value.requires_grad
+    lora_a_parameters = [p for name, p in encoder.vit.named_parameters() if ".lora_a." in name]
+    lora_b_parameters = [p for name, p in encoder.vit.named_parameters() if ".lora_b." in name]
+    base_parameters = {
+        name: value for name, value in encoder.vit.named_parameters()
+        if ".lora_a." not in name and ".lora_b." not in name
     }
+    base_before = {name: value.detach().cpu().clone() for name, value in base_parameters.items()}
     # All pretrained parameters remain frozen. The optimizer contains only adapters + head.
-    if any(p.requires_grad for name, p in encoder.vit.named_parameters()
-           if ".lora_a." not in name and ".lora_b." not in name):
+    base_frozen = not any(p.requires_grad for p in base_parameters.values())
+    if not base_frozen:
         raise RuntimeError("Pretrained ViT weights must stay frozen")
+    expected_trainable = {id(p) for p in lora_a_parameters + lora_b_parameters + list(head.parameters())}
+    optimizer_ids = [id(p) for group in optimizer.param_groups for p in group["params"]]
+    optimizer_matches = len(optimizer_ids) == len(set(optimizer_ids)) and set(optimizer_ids) == expected_trainable
+    if not optimizer_matches:
+        raise RuntimeError("Optimizer parameters differ from LoRA A/B + classifier head")
 
     history = []
+    base_gradient_tensors_max = 0
     stream = iter(train_loader)
     encoder.train()
     head.train()
@@ -149,13 +163,16 @@ def run(cfg: DictConfig) -> dict:
                         if p.grad is not None)
         if not torch.isfinite(torch.tensor([adapter_grad, head_grad])).all():
             raise RuntimeError(f"Non-finite gradient at step {step}")
-        if any(p.grad is not None for name, p in encoder.vit.named_parameters()
-               if ".lora_a." not in name and ".lora_b." not in name):
+        base_gradient_tensors = sum(p.grad is not None for p in base_parameters.values())
+        base_gradient_tensors_max = max(base_gradient_tensors_max, base_gradient_tensors)
+        if base_gradient_tensors:
             raise RuntimeError("Frozen ViT parameter received a gradient")
         optimizer.step()
         accuracy = float((logits.argmax(dim=1) == labels).float().mean().item())
         item = {"step": step, "loss": float(loss.detach().item()), "train_accuracy": accuracy,
-                "adapter_grad_norm_sum": adapter_grad, "head_grad_norm_sum": head_grad}
+                "adapter_grad_norm_sum": adapter_grad, "head_grad_norm_sum": head_grad,
+                "lora_a_grad_norm_sum": grad_norm_sum(lora_a_parameters),
+                "lora_b_grad_norm_sum": grad_norm_sum(lora_b_parameters)}
         history.append(item)
         print(json.dumps(item))
 
@@ -163,13 +180,17 @@ def run(cfg: DictConfig) -> dict:
     adapter_update = sum(float((v - adapter_before[k]).norm().item()) for k, v in adapter_after.items())
     head_update = sum(float((value.detach().cpu() - head_before[name].cpu()).norm().item())
                       for name, value in head.state_dict().items())
-    if any(not torch.equal(parameter.detach().cpu(), base_before[name])
-           for name, parameter in encoder.vit.named_parameters() if not parameter.requires_grad):
+    base_changed = changed_tensors(base_before, base_parameters)
+    if base_changed:
         raise RuntimeError("A frozen ViT parameter changed during training")
     if cfg.lora.enabled and adapter_update <= 0:
         raise RuntimeError("No adapter parameter changed during real-image training")
     if head_update <= 0:
         raise RuntimeError("No classifier parameter changed")
+    lora_a_before = {k: v for k, v in adapter_before.items() if ".lora_a." in k}
+    lora_b_before = {k: v for k, v in adapter_before.items() if ".lora_b." in k}
+    lora_a_after = {k: v for k, v in adapter_after.items() if ".lora_a." in k}
+    lora_b_after = {k: v for k, v in adapter_after.items() if ".lora_b." in k}
 
     output_dir = Path(HydraConfig.get().runtime.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -193,7 +214,10 @@ def run(cfg: DictConfig) -> dict:
         expected_logits = head(encoder(sample)).detach().clone()
     load_adapter_head_checkpoint(path, encoder, head, metadata)
     with torch.no_grad():
-        torch.testing.assert_close(head(encoder(sample)), expected_logits, rtol=1e-5, atol=1e-6)
+        reloaded_logits = head(encoder(sample))
+    reload_max_abs_diff = float((reloaded_logits - expected_logits).abs().max().item())
+    roundtrip_passed = bool(torch.allclose(reloaded_logits, expected_logits, rtol=RELOAD_RTOL, atol=RELOAD_ATOL))
+    torch.testing.assert_close(reloaded_logits, expected_logits, rtol=RELOAD_RTOL, atol=RELOAD_ATOL)
 
     report = {
         "model_checkpoint": str(cfg.model.checkpoint_id),
@@ -206,11 +230,37 @@ def run(cfg: DictConfig) -> dict:
         "trainable_parameters": sum(p.numel() for p in trainable),
         "adapter_update_norm_sum": adapter_update,
         "head_update_norm_sum": head_update,
+        "lora": {key: metadata[key] for key in ("enabled", "rank", "alpha", "dropout")},
+        "seed": int(cfg.training.seed),
+        "train_subset_size": int(cfg.data.train_subset_size),
+        "batch_size": int(cfg.training.batch_size),
+        "verification": {
+            "base_parameter_tensors": len(base_parameters),
+            "base_parameters": sum(p.numel() for p in base_parameters.values()),
+            "base_frozen_requires_grad": base_frozen,
+            "base_gradient_tensors_max": base_gradient_tensors_max,
+            "base_changed_tensors": base_changed,
+            "optimizer_matches_trainable_parameters": optimizer_matches,
+            "lora_a_tensors": len(lora_a_after),
+            "lora_a_changed_tensors": changed_tensors(lora_a_before, lora_a_after),
+            "lora_a_update_norm_sum": update_norm_sum(lora_a_before, lora_a_after),
+            "lora_b_tensors": len(lora_b_after),
+            "lora_b_changed_tensors": changed_tensors(lora_b_before, lora_b_after),
+            "lora_b_update_norm_sum": update_norm_sum(lora_b_before, lora_b_after),
+            "head_tensors": len(head_before),
+            "head_changed_tensors": changed_tensors(head_before, head.state_dict()),
+            "reload_logits_max_abs_diff": reload_max_abs_diff,
+            "checkpoint_roundtrip_passed": roundtrip_passed,
+            "checkpoint_roundtrip_tolerance": {"rtol": RELOAD_RTOL, "atol": RELOAD_ATOL},
+        },
         "history": history,
     }
+    report["checks"] = evaluate_checks(report)
     (output_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (output_dir / "resolved_config.yaml").write_text(OmegaConf.to_yaml(cfg, resolve=True), encoding="utf-8")
-    print(f"Saved: {path}, report.json, resolved_config.yaml")
+    write_verification_artifacts(output_dir, report)
+    print(f"Saved: {path}, report.json, resolved_config.yaml, loss.png, lora_grad_norm.png, "
+          "verification_summary.md")
     return report
 
 
