@@ -1,0 +1,37 @@
+# Independent MoCo v2-style CIFAR-10 mechanics check; does not change conf/config.yaml.
+# Gate B (defaults): 20 steps, constant LR. Gate C: training.max_steps=500 training.scheduler=cosine.
+model:
+  name: resnet18_cifar  # torchvision resnet18(weights=None), 3x3 stem, no max-pool, 512-d pooled feature
+  projection_dim: 128
+
+moco:
+  queue_size: 1024  # K; must be a multiple of training.batch_size
+  momentum: 0.999  # key EMA m
+  temperature: 0.2  # T
+
+data:
+  name: CIFAR10
+  split: train
+  root: ./downloaded_data
+  download: false  # explicitly opt in before fetching the dataset
+
+training:
+  seed: 0
+  batch_size: 32
+  max_steps: 20
+  learning_rate: 0.00375  # official lr 0.03 / batch 256 scaled to batch 32
+  momentum: 0.9
+  weight_decay: 0.0001
+  nesterov: false
+  scheduler: none  # none (Gate B smoke) | cosine (Gate C pilot)
+  device: cpu  # use training.device=cuda explicitly to occupy a GPU
+  resume: null  # path to a checkpoint.pt; continues into a new run directory
+
+logging:
+  comet_enabled: false
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: log/moco_standalone/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
