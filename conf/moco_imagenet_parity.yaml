@@ -1,0 +1,76 @@
+# Spec A (2026-10-17): Meta MoCo v2 (independent clone) vs self DistributedMoCo, ImageNet-1K ResNet50, 2-GPU DDP.
+# Independent of conf/config.yaml and conf/moco_standalone.yaml. GPU runs need separate approval (spec §6, §11.2).
+implementation: self  # self | meta_reference
+run_kind: parity  # parity: canonical fixture + phase traces | bench: ImageNet DataLoader, VRAM/throughput
+gate: A2  # A1 | A2 | A3 | A4 | A5 (label for artifacts and Comet)
+
+reference:
+  root: /mnt/HDD12TB-1/ishikawa/facebookresearch-moco  # clone outside this repository, detached at the commit below
+  commit: a419ef282fc9885015674e77f58c59447206a27f
+
+model:
+  arch: resnet50  # torchvision, weights=None
+  projection_dim: 128
+  mlp: true  # 2048 -> 2048 -> 128
+
+moco:
+  queue_size: 65536  # K; a multiple of the global batch
+  momentum: 0.999
+  temperature: 0.2
+
+data:
+  root: /mnt/NAS-TVS872XT/dataset/ImageNet  # read-only; never downloaded, moved or reorganized
+  split: train
+  image_size: 224
+  num_workers: 8  # per rank (bench and the real-image fixture)
+
+fixture:
+  path: null  # fixture.pt from scripts.parity.build_moco_parity_fixture; required for run_kind=parity
+  kind: synthetic  # build only: synthetic | imagenet
+  imagenet_steps: 1  # build only: steps of real-image views stored for kind=imagenet
+
+distributed:
+  world_size: 2
+  backend: nccl  # gloo only for CPU tests of implementation=self
+  broadcast_buffers: true  # DDP default, as in main_moco.py
+  timeout_minutes: 10
+
+training:
+  seed: 0
+  local_batch_size: 32  # global 64
+  max_steps: 1
+  learning_rate: 0.0075
+  momentum: 0.9
+  weight_decay: 0.0001
+  epochs: 10  # main_moco --cos horizon; LR is set per epoch and every parity/bench step here lies in epoch 0
+  cos: true
+  device: cuda  # cuda: one GPU per rank from CUDA_VISIBLE_DEVICES | cpu: gloo tests (self only)
+  resume: null  # <run_dir>/checkpoint_stepNNNNNN.pt; continues from its sidecars
+  checkpoint_steps: []  # save after these completed steps
+
+precision:
+  dtype: float32
+  amp: false
+  fp32_precision: ieee  # TF32 off for cuDNN conv and CUDA matmul
+  cudnn_deterministic: true
+  cudnn_benchmark: false
+
+trace:
+  full_steps: [1]  # steps that also store full params, grads, momentum, BN buffers, queue and logits
+
+verification:
+  rtol: 1.0e-5  # provisional (spec §5.3, B2); fix before the judged run
+  atol: 1.0e-6
+
+bench:
+  warmup_steps: 10
+
+logging:
+  comet_enabled: true
+  comet_project: null  # null: from .comet.config / ~/.comet.config
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: log/moco_imagenet_parity/runs/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}_${implementation}_${run_kind}_${gate}
